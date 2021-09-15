@@ -648,7 +648,7 @@ ProgramFuseLock(uint8_t command, uint8_t byteSel)
     // AT90S1200 and AT90S4414/8515 don't generate any activity on RDY/BSY pin.
     // So just ignore the return value even if timeout occurs.
     HVPPPollWait(pollTimeout);
-    SMoCommand::SendResponse(STATUS_CMD_OK);
+    SMoCommand::SendResponse();
 }
 
 static void

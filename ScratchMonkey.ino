@@ -68,6 +68,14 @@ loop()
     case CMD_LOAD_ADDRESS:
         SMoGeneral::LoadAddress();
         break;
+    case CMD_SET_DEVICE_PARAMETERS:
+    case CMD_OSCCAL:
+    case CMD_FIRMWARE_UPGRADE:
+    case CMD_CHECK_TARGET_CONNECTION:
+    case CMD_LOAD_RC_ID_TABLE:
+    case CMD_LOAD_EC_ID_TABLE:
+        SMoCommand::SendResponse(); // just ignore
+        break;
     case CMD_SET_CONTROL_STACK:
         SMoGeneral::SetControlStack();
         break;
@@ -120,9 +128,11 @@ loop()
         // HVSP Commands
         //
     case CMD_ENTER_PROGMODE_HVSP:
+    case CMD_ENTER_PROGMODE_HVSP_STK600:
         SMoHVSP::EnterProgmode();
         break;
     case CMD_LEAVE_PROGMODE_HVSP:
+    case CMD_LEAVE_PROGMODE_HVSP_STK600:
         SMoHVSP::LeaveProgmode();
         break;
     case CMD_CHIP_ERASE_HVSP:

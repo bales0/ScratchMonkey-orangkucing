@@ -420,7 +420,7 @@ ProgramFuseLock(uint8_t command, uint8_t byteSel)
     // ATtiny11 doesn't generate any activity on SDO pin.
     // So just ignore the return value even if timeout occurs.
     HVSPPollWait(pollTimeout);
-    SMoCommand::SendResponse(STATUS_CMD_OK);
+    SMoCommand::SendResponse();
 }
 
 static void

@@ -194,7 +194,11 @@ SMoISP::EnterProgmode()
     SPCR &= ~_BV(CPOL) & ~_BV(CPHA); // idle LOW for SPI_MODE0
     //
     SPI.begin();
+#if !defined(STK600_EMU)
     SPI.beginTransaction(SMoGeneral::gSCKDuration > 2 ? ISPSPISetting[2] : ISPSPISetting[SMoGeneral::gSCKDuration]);
+#else
+    SPI.beginTransaction(ISPSPISetting[SMoGeneral::gSCKDuration > 60 ? 2 : (SMoGeneral::gSCKDuration > 3 ? 1 : 0)]);
+#endif
     ISPAssertReset();
     pinMode(ISP_RESET, OUTPUT);
     delay(stabDelay);

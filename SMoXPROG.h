@@ -36,6 +36,7 @@ namespace SMoXPROG {
 #define XPRG_MODE_PDI                       0
 #define XPRG_MODE_JTAG                      1
 #define XPRG_MODE_TPI                       2
+#define XPRG_MODE_UPDI                      3
 
 // XPROG commands
 #define XPRG_CMD_ENTER_PROGMODE             0x01

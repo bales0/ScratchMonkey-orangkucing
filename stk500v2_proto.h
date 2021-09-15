@@ -29,6 +29,9 @@
 #define CMD_OSCCAL                          0x05
 #define CMD_LOAD_ADDRESS                    0x06
 #define CMD_FIRMWARE_UPGRADE                0x07
+#define CMD_CHECK_TARGET_CONNECTION         0x0D
+#define CMD_LOAD_RC_ID_TABLE                0x0E
+#define CMD_LOAD_EC_ID_TABLE                0x0F
 
 
 // *****************[ STK ISP command constants ]******************************
@@ -81,6 +84,10 @@
 #define CMD_READ_LOCK_HVSP                  0x3A
 #define CMD_READ_SIGNATURE_HVSP             0x3B
 #define CMD_READ_OSCCAL_HVSP                0x3C
+// These two are redefined since 0x30/0x31 collide
+// with the STK600 bootloader.
+#define CMD_ENTER_PROGMODE_HVSP_STK600      0x3D
+#define CMD_LEAVE_PROGMODE_HVSP_STK600      0x3E
 
 // *****************[ STK XPROG command constants ]*****************************
 
@@ -101,8 +108,12 @@
 #define STATUS_CMD_FAILED                   0xC0
 #define STATUS_CKSUM_ERROR                  0xC1
 #define STATUS_CMD_UNKNOWN                  0xC9
+#define STATUS_CMD_ILLEGAL_PARAMETER        0xCA
 
 // *****************[ STK parameter constants ]***************************
+#define PARAM_JTAG_ALLOW_FULL_PAGE_STREAM   0x50 // also set in TPI
+#define PARAM_JTAG_EEPROM_PAGE_SIZE         0x52 // also set in TPI
+
 #define PARAM_BUILD_NUMBER_LOW              0x80
 #define PARAM_BUILD_NUMBER_HIGH             0x81
 #define PARAM_HW_VER                        0x90
@@ -119,9 +130,32 @@
 #define PARAM_RESET_POLARITY                0x9E
 #define PARAM_CONTROLLER_INIT               0x9F
 
-#define PARAM_DISCHARGEDELAY                0xA4 /* STK600 */
+#define PARAM_STATUS_TGT_CONN               0xA1
+#define PARAM_DISCHARGEDELAY                0xA4
+#define PARAM_SOCKETCARD_ID                 0xA5
+#define PARAM_ROUTINGCARD_ID                0xA6
+#define PARAM_EXPCARD_ID                    0xA7
+#define PARAM_SW_MAJOR_SLAVE1               0xA8
+#define PARAM_SW_MINOR_SLAVE1               0xA9
+#define PARAM_SW_MAJOR_SLAVE2               0xAA
+#define PARAM_SW_MINOR_SLAVE2               0xAB
+#define PARAM_BOARD_ID_STATUS               0xAD
+#define PARAM_RESET                         0xB4
+#define PARAM_VTG_SETPOINT                  0xB7
+
+#define PARAM2_SCK_DURATION                 0xC0
+#define PARAM2_CLOCK_CONF                   0xC1
+#define PARAM2_AREF0                        0xC2
+#define PARAM2_AREF1                        0xC3
+
+#define PARAM2_JTAG_FLASH_SIZE_H            0xC5 // also set in TPI
+#define PARAM2_JTAG_FLASH_SIZE_L            0xC6 // also set in TPI
+#define PARAM2_JTAG_FLASH_PAGE_SIZE         0xC7 // also set in TPI
+#define PARAM2_RC_ID_TABLE_REV              0xC8
+#define PARAM2_EC_ID_TABLE_REV              0xC9
+#define PARAM2_AREF0_SETPOINT               0xCC
+#define PARAM2_AREF1_SETPOINT               0xCD
 
 // *****************[ STK answer constants ]***************************
 
 #define ANSWER_CKSUM_ERROR                  0xB0
-

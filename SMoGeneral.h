@@ -20,8 +20,14 @@
 
 #include <inttypes.h>
 
+#undef STK600_EMU
+
 namespace SMoGeneral {
+#if !defined(STK600_EMU)
     extern uint8_t  gSCKDuration;
+#else
+    extern uint16_t gSCKDuration;
+#endif
     extern union address_t {
         uint32_t l;
         uint8_t c[4];
