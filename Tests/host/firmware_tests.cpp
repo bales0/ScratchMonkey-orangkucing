@@ -5,13 +5,13 @@
 #include "SMoXPROG.h"
 #include "SMoTPI.h"
 #include "SMoPDI.h"
+#include "SMoHVPP.h"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
 
-SMoGeneral::address_t SMoGeneral::gAddress{};
-uint8_t SMoGeneral::gVoltage=50;
-uint8_t SMoGeneral::gDischargeDelay=232;
+void protocol_tests();
+int firmware_bridge(const char *);
 
 void check(bool ok, const char *message) {
     if(!ok) throw std::runtime_error(message);
@@ -82,6 +82,14 @@ void parser_tests() {
     bool rejectedHeader=false;
     while(Serial.available()) rejectedHeader|=SMoCommand::GetNextCommand()==SMoCommand::kHeaderError;
     check(rejectedHeader,"empty frame accepted");
+    Serial.input={MESSAGE_START,1,1,20,TOKEN}; // body size 276 exceeds 275
+    rejectedHeader=false;
+    while(Serial.available()) rejectedHeader|=SMoCommand::GetNextCommand()==SMoCommand::kHeaderError;
+    check(rejectedHeader,"oversize frame header accepted");
+    Serial.input.assign(packet.begin(),packet.end());
+    while(Serial.available()) command=SMoCommand::GetNextCommand();
+    check(command==CMD_SIGN_ON,"parser did not recover after oversize frame");
+    SMoCommand::SendResponse();
 }
 void xprog_tests() {
     mode(XPRG_MODE_TPI);
@@ -100,36 +108,65 @@ void xprog_tests() {
     reply=request({CMD_XPROG,XPRG_CMD_SET_PARAM,XPRG_PARAM_FLASHPAGESIZE,2,0});
     check(reply[2]==XPRG_ERR_OK && SMoXPROG::XPRGParam.FlashPageSize==512,"flash page size decoding");
 }
-void timeout_tests() {
-    mode(XPRG_MODE_TPI);
-    mockTick=1; mockTime=0;
-    auto reply=request({CMD_XPROG,XPRG_CMD_ENTER_PROGMODE});
-    check(reply[2]==XPRG_ERR_TIMEOUT && mockTime<1000,"TPI missing target timeout");
-    check(!SPI.active && mockPins[11]==LOW,"TPI timeout did not release SPI/HV");
-    reply=request({CMD_XPROG,XPRG_CMD_READ_MEM,1,0,0,0,0,0,1});
-    check(reply.size()==3 && reply[2]==XPRG_ERR_TIMEOUT,"TPI read timeout lost");
+void hvpp_read_tests() {
+    // Distinct control-stack values expose low/high-byte selection mistakes.
+    std::fill_n(SMoGeneral::gControlStack,32,0);
+    SMoGeneral::gControlStack[8]=0x10;  // load command, low byte
+    SMoGeneral::gControlStack[0]=0x20;  // load address, low byte
+    SMoGeneral::gControlStack[20]=0x40; // enable read, low byte
+    SMoGeneral::gControlStack[21]=0x60; // enable read, high byte
+    SMoGeneral::gControlStack[12]=0x80; // done, low byte
+    SMoGeneral::gControlStack[13]=0xA0; // done, high byte
+    SMoGeneral::gControlStack[25]=0xFB; // RDY/BSY is an input
 
-    // Decode valid TPI frames whose status never sets NVMEN.
-    SPI.receive.clear();
-    SPI.receive.push_back(0xFF); SPI.receive.push_back(0xFF); // activation clocks
-    for(int i=0;i<1000;i++) { SPI.receive.push_back(0); SPI.receive.push_back(0xFE); SPI.receive.push_back(0xFF); }
-    mockTime=0;
-    reply=request({CMD_XPROG,XPRG_CMD_ENTER_PROGMODE});
-    check(reply[2]==XPRG_ERR_TIMEOUT && mockTime<1000,"TPI NVM activation has no deadline");
-    SPI.receive.clear();
+    for(uint8_t index=0;index<5;++index) {
+        const bool calibration=index>=3;
+        const uint8_t command=calibration ? CMD_READ_OSCCAL_PP : CMD_READ_SIGNATURE_PP;
+        const uint8_t address=calibration ? index-3 : index;
+        const uint8_t data=calibration ? 0xA5 : uint8_t(0x1E + index);
+        DDRB=0xFF;
+        PINB=data;
+        SMoCommand::gBody[0]=command;
+        SMoCommand::gBody[1]=address;
+        SMoCommand::gSize=2;
+        Serial.output.clear();
+        mockPortTrace.clear();
+        mockPortTraceEnabled=true;
+        if(calibration) SMoHVPP::ReadOscCal();
+        else SMoHVPP::ReadSignature();
+        mockPortTraceEnabled=false;
 
-    mode(XPRG_MODE_PDI);
-    SMoXPROG::XPRGParam.FlashPageSize=2;
-    mockTick=101;
-    reply=request({CMD_XPROG,XPRG_CMD_WRITE_MEM,1,2,0,0,0,0,0,2,0x12,0x34});
-    check(reply==std::vector<uint8_t>({CMD_XPROG,XPRG_CMD_WRITE_MEM,XPRG_ERR_TIMEOUT}),"PDI write timeout status/framing");
-    mockTick=1;
+        const std::vector<MockPortEvent> expected={
+            {MockPortOperation::ControlSignals,0x10},
+            {MockPortOperation::ControlSignals,0x20},
+            {MockPortOperation::DataDirection,0x00},
+            {MockPortOperation::ControlSignals,uint8_t(calibration ? 0x60 : 0x40)},
+            {MockPortOperation::DataRead,data},
+            {MockPortOperation::ControlSignals,uint8_t(calibration ? 0xA0 : 0x80)},
+            {MockPortOperation::DataDirection,0xFF},
+        };
+        check(mockPortTrace.size()>expected.size(),"HVPP missing port/response trace");
+        for(size_t i=0;i<expected.size();++i) {
+            check(mockPortTrace[i].operation==expected[i].operation &&
+                  mockPortTrace[i].value==expected[i].value,
+                  "HVPP must read with INPUT, apply DONE, restore OUTPUT, then reply");
+        }
+        for(size_t i=expected.size();i<mockPortTrace.size();++i)
+            check(mockPortTrace[i].operation==MockPortOperation::SerialWrite,
+                  "HVPP changed ports after starting response");
+        check(PORTB==address,"HVPP signature/calibration address");
+        check(uint8_t(DDRB)==0xFF,"HVPP data bus not restored to OUTPUT");
+        check(response()==std::vector<uint8_t>({command,STATUS_CMD_OK,data}),
+              "HVPP signature/calibration response");
+    }
 }
-int main() {
+int main(int argc,char **argv) {
     try {
+        if(argc==3 && std::string(argv[1])=="--bridge") return firmware_bridge(argv[2]);
         parser_tests(); std::cout<<"PASS parser recovery, wraparound, checksum\n";
         xprog_tests(); std::cout<<"PASS XPROG validation and parameter decoding\n";
-        timeout_tests(); std::cout<<"PASS TPI deadlines/cleanup and PDI error propagation\n";
+        protocol_tests();
+        hvpp_read_tests(); std::cout<<"PASS HVPP signature/calibration port sequence and response\n";
         return 0;
     } catch(const std::exception &e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

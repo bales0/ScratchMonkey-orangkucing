@@ -18,6 +18,7 @@
 #define _SMO_PDI_
 
 namespace SMoPDI {
+    void Release();
     extern uint16_t EnterProgmode();
     extern uint16_t LeaveProgmode();
     extern uint16_t Erase();

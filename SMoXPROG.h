@@ -18,6 +18,7 @@
 #define _SMO_XPROG_
 
 namespace SMoXPROG {
+    void Release();
     void XPROG();
     void XPROG_SetMode();
     extern struct param_t {

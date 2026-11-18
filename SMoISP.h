@@ -43,6 +43,7 @@
 #define _SMO_ISP_
 
 namespace SMoISP {
+    void Release();
     void EnterProgmode();
     void LeaveProgmode();
     void ChipErase();

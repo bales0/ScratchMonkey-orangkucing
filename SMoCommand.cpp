@@ -30,6 +30,7 @@ static uint8_t  sCheckSum           = 0;
 static uint32_t sLastByteTime       = 0;
 
 uint16_t SMoCommand::gSize;
+uint8_t SMoCommand::gProgrammingMode = 0;
 uint8_t  SMoCommand::gBody[kMaxBodySize+1];
 
 static enum {
@@ -111,6 +112,26 @@ SMoCommand::GetNextCommand()
 void        
 SMoCommand::SendResponse(uint8_t status, uint16_t bodySize)
 {
+    if (bodySize < 2 || bodySize > kMaxBodySize) {
+        status = STATUS_CMD_FAILED;
+        bodySize = 2;
+    }
+    if (gBody[0] != CMD_XPROG && gBody[0] != CMD_XPROG_SETMODE) {
+        switch (gBody[0]) {
+        case CMD_ENTER_PROGMODE_ISP:
+        case CMD_ENTER_PROGMODE_PP:
+        case CMD_ENTER_PROGMODE_HVSP:
+        case CMD_ENTER_PROGMODE_HVSP_STK600:
+            if (status == STATUS_CMD_OK) gProgrammingMode = gBody[0];
+            break;
+        case CMD_LEAVE_PROGMODE_ISP:
+        case CMD_LEAVE_PROGMODE_PP:
+        case CMD_LEAVE_PROGMODE_HVSP:
+        case CMD_LEAVE_PROGMODE_HVSP_STK600:
+            if (status == STATUS_CMD_OK) gProgrammingMode = 0;
+            break;
+        }
+    }
     gBody[1] = status;
     sCheckSum   = MESSAGE_START ^ TOKEN ^ sSequenceNumber;
     Serial.write(MESSAGE_START);

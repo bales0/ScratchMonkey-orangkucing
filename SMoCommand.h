@@ -29,11 +29,14 @@ namespace SMoCommand {
     };
     extern uint8_t  gBody[];
     extern uint16_t gSize;
+    extern uint8_t gProgrammingMode;
+    bool CheckSession();
     //
     // Parse next command, return command code if command is fully read
     // and checksum matches. Handles timeouts and checksum errors 
     // autonomously.
     //
+    bool        ValidRequest();
     int         GetNextCommand();
     void        SendResponse(uint8_t status = STATUS_CMD_OK, uint16_t bodySize=2);
 } // namespace SMoCommand

@@ -20,6 +20,7 @@
 #include "SMoCommand.h"
 #include "SMoGeneral.h"
 #include "SMoConfig.h"
+#include "SMoSafety.h"
 
 #ifdef DEBUG_HVPP
 #include "SMoDebug.h"
@@ -412,6 +413,9 @@ SMoHVPP::EnterProgmode()
     const uint8_t   resetDelayMs = SMoCommand::gBody[6];
     const uint8_t   resetDelayUs = SMoCommand::gBody[7];
 
+    SMoStopClock();
+    SPI.endTransaction();
+    SPI.end();
     delay(progModeDelay);
     // power off target
 #ifdef SMO_AVCC
@@ -435,10 +439,10 @@ SMoHVPP::EnterProgmode()
     // make sure HVPP_VCC is 0V
     if (toggleVtg) {
 #ifdef SMO_AVCC
-        uint32_t time = millis();
-        while (analogRead(SMO_AVCC) > 10) { // wait until HVPP_VCC becomes lower than 0.06V
-            if (millis() - time > DEFAULTTIMEOUT)
-                break;
+        if (!SMoWaitVoltage(false)) {
+            SMoAbortHV();
+            SMoCommand::SendResponse(STATUS_CMD_FAILED);
+            return;
         }
 #endif
         delay(powerOffDelay);
@@ -447,10 +451,10 @@ SMoHVPP::EnterProgmode()
 #ifdef SMO_AVCC
     analogWrite(HVPP_VCC, 255);
     {
-        uint32_t time = millis();
-        while (analogRead(SMO_AVCC) < 743) {   // wait until HVPP_VCC becomes higher than 4.5V
-            if (millis() - time > DEFAULTTIMEOUT)
-                break;
+        if (!SMoWaitVoltage(true)) {
+            SMoAbortHV();
+            SMoCommand::SendResponse(STATUS_CMD_FAILED);
+            return;
         }
     }
     analogWrite(HVPP_VCC, FIVEVOLT);
@@ -485,15 +489,17 @@ SMoHVPP::LeaveProgmode()
 #endif
     digitalWrite(HVPP_RESET, HIGH);
     delayMicroseconds(resetDelay * 10);
+    HVPPEndControls();
+    SMoReleaseHVBus();
 
 #ifdef SMO_AVCC
     digitalWrite(SMO_HVENABLE, LOW); // disable 12V
     analogWrite(HVPP_VCC, 255);
     {
-        uint32_t time = millis();
-        while (analogRead(SMO_AVCC) < 743) {   // wait until HVPP_VCC becomes higher than 4.5V
-            if (millis() - time > DEFAULTTIMEOUT)
-                break;
+        if (!SMoWaitVoltage(true)) {
+            SMoAbortHV();
+            SMoCommand::SendResponse(STATUS_CMD_FAILED);
+            return;
         }
     }
     analogWrite(HVPP_VCC, FIVEVOLT);
@@ -514,8 +520,11 @@ SMoHVPP::ChipErase()
     delay(pulseWidth);
     HVPPControls(HVPPControlPattern(kDone, kLowByte));
     // SMoGeneral::gControlStack[kPoll] is simply ignored. :)
-    if (pollTimeout)
-        HVPPPollWait(pollTimeout);
+    if (pollTimeout && !HVPPPollWait(pollTimeout)) {
+        SMoAbortHV();
+        SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
+        return;
+    }
     SMoCommand::SendResponse();
 }
 
@@ -527,7 +536,7 @@ ProgramMemory(bool flash)
     const uint8_t   pollTimeout = SMoCommand::gBody[4];
     const uint8_t * data        = &SMoCommand::gBody[5];
 
-    uint16_t pageMask = (1 << ((mode & 0x0E ? mode & 0x0E : 0x10) >> 1) - (flash ? 1 : 0)) - 1;
+    uint16_t pageMask = (1U << (((mode & 0x0E ? mode & 0x0E : 0x10) >> 1) - (flash ? 1 : 0))) - 1;
     int8_t b;
     HVPPControls(HVPPControlPattern(kLoadCommand, kLowByte), (uint8_t)(flash ? HVPP_WriteFlash : HVPP_WriteEEPROM));
     if (SMoGeneral::gAddress.d.extH & 0x80)
@@ -548,7 +557,7 @@ ProgramMemory(bool flash)
             SMoGeneral::gAddress.d.addr++;
             if (mode & 1) { // Page mode
                 HVPPControls(HVPPControlPattern(kPageLoad, kLowByte)); // assert PAGEL
-                if (!(SMoGeneral::gAddress.d.addr & pageMask) && mode & 0x80 || (numBytes == 0 && mode & 0x40)) { // Write page to memory
+                if ((!(SMoGeneral::gAddress.d.addr & pageMask) && (mode & 0x80)) || (numBytes == 0 && (mode & 0x40))) { // Write page to memory
                     HVPPControls(HVPPControlPattern(kCommitData, kLowByte));
                     HVPPControls(HVPPControlPattern(kDone, kLowByte));
                     if (!HVPPPollWait(pollTimeout))
@@ -570,6 +579,7 @@ ProgramMemory(bool flash)
     SMoCommand::SendResponse();
     return;
 TIMEOUT_ProgramMemory:
+    SMoAbortHV();
     SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
 }
 
@@ -605,8 +615,8 @@ ReadMemory(bool flash)
         }
     } while (numBytes);
     *dataOut++ = STATUS_CMD_OK;
-    SMoCommand::SendResponse(STATUS_CMD_OK, dataOut - &SMoCommand::gBody[0]);
     HVPPSetDataMode(OUTPUT);
+    SMoCommand::SendResponse(STATUS_CMD_OK, dataOut - &SMoCommand::gBody[0]);
 }
 
 void
@@ -645,9 +655,17 @@ ProgramFuseLock(uint8_t command, uint8_t byteSel)
     HVPPControls(HVPPControlPattern(kCommitData, byteSel));
     delay(pulseWidth);
     HVPPControls(HVPPControlPattern(kDone, byteSel));
-    // AT90S1200 and AT90S4414/8515 don't generate any activity on RDY/BSY pin.
-    // So just ignore the return value even if timeout occurs.
-    HVPPPollWait(pollTimeout);
+    // Classic control stacks (1200/4414/8515) require a timed fuse/lock
+    // cycle. Their 0x0E address/0xBE page-load patterns identify that wiring.
+    const bool timed = SMoGeneral::gControlStack[kLoadAddr] == 0x0E &&
+        SMoGeneral::gControlStack[kPageLoad] == 0xBE;
+    if (timed || !pollTimeout)
+        delay(pollTimeout);
+    else if (!HVPPPollWait(pollTimeout)) {
+        SMoAbortHV();
+        SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
+        return;
+    }
     SMoCommand::SendResponse();
 }
 
@@ -661,8 +679,8 @@ ReadFuseLock(uint8_t byteSel)
     HVPPControls(HVPPControlPattern(kEnableRead, byteSel), (uint8_t *)dataOut);
     HVPPControls(HVPPControlPattern(kDone, byteSel));
 
-    SMoCommand::SendResponse(STATUS_CMD_OK, 3);
     HVPPSetDataMode(OUTPUT);
+    SMoCommand::SendResponse(STATUS_CMD_OK, 3);
 }
 
 void
@@ -702,10 +720,10 @@ ReadSignatureCal(uint8_t byteSel, uint8_t addr)
     HVPPControls(HVPPControlPattern(kLoadAddr, kLowByte), addr);
     HVPPSetDataMode(INPUT);
     HVPPControls(HVPPControlPattern(kEnableRead, byteSel), (uint8_t *)dataOut);
-    HVPPControlPattern(kDone, byteSel);
+    HVPPControls(HVPPControlPattern(kDone, byteSel));
+    HVPPSetDataMode(OUTPUT);
 
     SMoCommand::SendResponse(STATUS_CMD_OK, 3);
-    HVPPSetDataMode(OUTPUT);
 }
 
 void
@@ -719,7 +737,7 @@ SMoHVPP::ReadSignature()
 void
 SMoHVPP::ReadOscCal()     
 {
-    ReadSignatureCal(kHighByte, 0x00);
+    ReadSignatureCal(kHighByte, SMoCommand::gBody[1]);
 }
 
 //

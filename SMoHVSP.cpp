@@ -20,6 +20,7 @@
 #include "SMoCommand.h"
 #include "SMoGeneral.h"
 #include "SMoConfig.h"
+#include "SMoSafety.h"
 
 #ifdef DEBUG_HVSP
 #include "SMoDebug.h"
@@ -174,6 +175,9 @@ SMoHVSP::EnterProgmode()
     const uint8_t   resetDelayMs = SMoCommand::gBody[7];
     const uint8_t   resetDelayUs = SMoCommand::gBody[8];
 
+    SMoStopClock();
+    SPI.endTransaction();
+    SPI.end();
     delay(progModeDelay);
     // power off target
 #ifdef SMO_AVCC
@@ -217,10 +221,10 @@ SMoHVSP::EnterProgmode()
     // make sure HVSP_VCC is 0V
     if (toggleVtg) {
 #ifdef SMO_AVCC
-        uint32_t time = millis();
-        while (analogRead(SMO_AVCC) > 10) { // wait until HVSP_VCC becomes lower than 0.06V
-            if (millis() - time > DEFAULTTIMEOUT)
-                break;
+        if (!SMoWaitVoltage(false)) {
+            SMoAbortHV();
+            SMoCommand::SendResponse(STATUS_CMD_FAILED);
+            return;
         }
 #endif
         delay(powerOffDelay);
@@ -229,10 +233,10 @@ SMoHVSP::EnterProgmode()
 #ifdef SMO_AVCC
     analogWrite(HVSP_VCC, 255);
     {
-        uint32_t time = millis();
-        while (analogRead(SMO_AVCC) < 743) {   // wait until HVSP_VCC becomes higher than 4.5V
-            if (millis() - time > DEFAULTTIMEOUT)
-                break;
+        if (!SMoWaitVoltage(true)) {
+            SMoAbortHV();
+            SMoCommand::SendResponse(STATUS_CMD_FAILED);
+            return;
         }
     }
     analogWrite(HVSP_VCC, FIVEVOLT);
@@ -266,15 +270,16 @@ SMoHVSP::LeaveProgmode()
 #endif
     digitalWrite(HVSP_RESET, HIGH);
     delayMicroseconds(resetDelay * 10);
+    SMoReleaseHVBus();
 
 #ifdef SMO_AVCC
     digitalWrite(SMO_HVENABLE, LOW); // disable 12V
     analogWrite(HVSP_VCC, 255);
     {
-        uint32_t time = millis();
-        while (analogRead(SMO_AVCC) < 743) {   // wait until HVSP_VCC becomes higher than 4.5V
-            if (millis() - time > DEFAULTTIMEOUT)
-                break;
+        if (!SMoWaitVoltage(true)) {
+            SMoAbortHV();
+            SMoCommand::SendResponse(STATUS_CMD_FAILED);
+            return;
         }
     }
     analogWrite(HVSP_VCC, FIVEVOLT);
@@ -296,6 +301,7 @@ SMoHVSP::ChipErase()
 
     if (pollTimeout) {
         if (!HVSPPollWait(pollTimeout)) {
+            SMoAbortHV();
             SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
             return;
         }
@@ -313,7 +319,7 @@ ProgramMemory(bool flash)
     const uint8_t   pollTimeout = SMoCommand::gBody[4];
     const uint8_t * data        = &SMoCommand::gBody[5];
 
-    uint16_t pageMask = (1 << ((mode & 0x0E ? mode & 0x0E : 0x10) >> 1) - (flash ? 1 : 0)) - 1;
+    uint16_t pageMask = (1U << (((mode & 0x0E ? mode & 0x0E : 0x10) >> 1) - (flash ? 1 : 0))) - 1;
     int8_t b;
     HVSPTransfer(HVSPControlPattern(sLoadCommand, sLowByte), flash ? SMoGeneral::gControlStack[sWriteFlash] : SMoGeneral::gControlStack[sWriteEEPROM]);
     HVSPTransfer(HVSPControlPattern(sLoadAddr, sHighByte), SMoGeneral::gAddress.c[1]);
@@ -334,7 +340,7 @@ ProgramMemory(bool flash)
         if (!(--numBytes & 1) || !flash) {
             SMoGeneral::gAddress.d.addr++;
             if (mode & 1) { // Page mode
-                if (!(SMoGeneral::gAddress.d.addr & pageMask) && mode & 0x80 || (numBytes == 0 && mode & 0x40)) { // Write page to memory
+                if ((!(SMoGeneral::gAddress.d.addr & pageMask) && (mode & 0x80)) || (numBytes == 0 && (mode & 0x40))) { // Write page to memory
                     HVSPTransfer(HVSPControlPattern(sCommitData, sLowByte));
                     HVSPTransfer(HVSPControlDone(sCommitData, sLowByte));
                     if (!HVSPPollWait(pollTimeout))
@@ -353,6 +359,7 @@ ProgramMemory(bool flash)
     SMoCommand::SendResponse();
     return;
 TIMEOUT_ProgramMemory:
+    SMoAbortHV();
     SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
 }
 
@@ -417,9 +424,17 @@ ProgramFuseLock(uint8_t command, uint8_t byteSel)
     HVSPTransfer(HVSPControlPattern(sLoadData, sLowByte), value);
     HVSPTransfer(HVSPControlPattern(sCommitData, byteSel));
     HVSPTransfer(HVSPControlDone(sCommitData, byteSel));
-    // ATtiny11 doesn't generate any activity on SDO pin.
-    // So just ignore the return value even if timeout occurs.
-    HVSPPollWait(pollTimeout);
+    // The legacy tiny11 stack has no extended/high fuse read controls.
+    // Keep its configured timed cycle instead of requiring a busy signal.
+    const bool timed = !SMoGeneral::gControlStack[sFuseRead + 1] &&
+        !SMoGeneral::gControlStack[sFuseRead + 2];
+    if (timed || !pollTimeout)
+        delay(pollTimeout);
+    else if (!HVSPPollWait(pollTimeout)) {
+        SMoAbortHV();
+        SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
+        return;
+    }
     SMoCommand::SendResponse();
 }
 
@@ -487,7 +502,7 @@ SMoHVSP::ReadSignature()
 void
 SMoHVSP::ReadOscCal()     
 {
-    ReadSignatureCal(0x00, sHighByte);
+    ReadSignatureCal(SMoCommand::gBody[1], sHighByte);
 }
 
 //

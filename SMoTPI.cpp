@@ -19,8 +19,12 @@
 #include "SMoCommand.h"
 #include "SMoGeneral.h"
 #include "SMoConfig.h"
+#include "SMoSafety.h"
 #include "SMoXPROG.h"
 #include "SMoTPI.h"
+#include "SMoSerialFrame.h"
+
+static uint8_t sReceiveError = XPRG_ERR_OK;
 
 //
 // Pin definitions
@@ -79,7 +83,7 @@ enum {
 // Non-Volatile Memory Busy
 #define NVMBSY 7
 
-static int8_t sPageMask;
+static uint8_t sPageMask = 1;
 
 /*
 * send two byte in two TPI frame (24 bits)
@@ -131,29 +135,12 @@ TPITransfer(uint8_t c)
 static bool
 TPILoad(uint8_t c, uint8_t *p)
 {
-    union {
-      uint32_t l;
-      uint8_t c[4];
-    } data;
-
-    data.l = 0;
     TPITransfer(c);
-    uint32_t started = millis();
-    do { // wait for the start bit
-        if ((uint32_t)(millis() - started) >= DEFAULTTIMEOUT)
-            return false;
-        data.c[1] = SPI.transfer(0xFF);
-    } while (data.c[1] == 0xFF);
-    data.c[0] = 0xFF; // sentinel
-    data.c[2] = SPI.transfer(0xFF);
-    // now the received 8 bit data is contained in data.c[2:1]
-    // Note: If the position of the start bit is within bit [7:5] of data.c[1]
-    // then 1 - 3 bits of the parity bit and/or stop bits are not received, yet.
-    SPI.transfer(0xFF); // receive remaining bits if any
-    while (data.c[1] != 0x7F)
-        data.l <<= 1;
-    *p = data.c[2];
-    return true;
+    SMoSerialFrameReader reader;
+    pinMode(MOSI, INPUT);
+    sReceiveError = reader.Read(p);
+    pinMode(MOSI, OUTPUT);
+    return sReceiveError == XPRG_ERR_OK;
 }
 
 static void
@@ -174,7 +161,7 @@ TPISendIdle(void)
     SPI.transfer(0xFF);
 }
 
-static void
+static bool
 TPIEnableTarget(void)
 {
     // enter TPI programming mode
@@ -199,10 +186,9 @@ TPIEnableTarget(void)
 
     // make sure power is off completely
 #ifdef SMO_AVCC
-    uint32_t time = millis();
-    while (analogRead(SMO_AVCC) > 10) { // wait until TPI_VCC becomes lower than 0.06V
-        if (millis() - time > DEFAULTTIMEOUT)
-            break;
+    if (!SMoWaitVoltage(false)) {
+        SMoAbortHV();
+        return false;
     }
 #else
     delay(DEFAULTTIMEOUT);
@@ -212,10 +198,9 @@ TPIEnableTarget(void)
 #ifdef SMO_AVCC
     analogWrite(TPI_VCC, 255);
     {
-        uint32_t time = millis();
-        while (analogRead(SMO_AVCC) < 743) {   // wait until TPI_VCC becomes higher than 4.5V
-            if (millis() - time > DEFAULTTIMEOUT)
-                break;
+        if (!SMoWaitVoltage(true)) {
+            SMoAbortHV();
+            return false;
         }
     }
     analogWrite(TPI_VCC, FIVEVOLT);
@@ -238,6 +223,7 @@ TPIEnableTarget(void)
     delayMicroseconds(SMoGeneral::gDischargeDelay);
     SPI.transfer(0xFF); // activate TPI by emitting 16 or more pulses on TPICLK
     SPI.transfer(0xFF);
+    return true;
 }
 
 static void
@@ -245,7 +231,10 @@ TPIDisableTarget(void)
 {
     SPI.endTransaction();
     SPI.end();
-    // deassert reset
+    pinMode(MOSI, INPUT);
+    pinMode(SCK, INPUT);
+    // deassert both direct and high-voltage reset paths
+    digitalWrite(TPI_HVRESET, HIGH);
     digitalWrite(TPI_RESET, HIGH);
 #if SMO_LAYOUT==SMO_LAYOUT_HVPROG2
     digitalWrite(SMO_HVENABLE, LOW); // disable 12V
@@ -256,7 +245,7 @@ static uint16_t
 TPITimeout()
 {
     TPIDisableTarget();
-    XPRG_Body[1] = XPRG_ERR_TIMEOUT;
+    XPRG_Body[1] = sReceiveError == XPRG_ERR_FAILED ? XPRG_ERR_FAILED : XPRG_ERR_TIMEOUT;
     return 2;
 }
 
@@ -280,10 +269,24 @@ uint16_t
 SMoTPI::EnterProgmode()
 {
     /* Enable TPI programming mode with the attached target */
-    TPIEnableTarget();
+    sReceiveError = XPRG_ERR_OK;
+    if (!TPIEnableTarget())
+        return TPITimeout();
+    uint8_t identity = 0;
+    // Only the non-mutating identity read can be retried transparently.
+    // Retrying a post-increment memory read could silently skip a byte.
+    for (uint8_t attempt = 0; attempt < 3; ++attempt)
+        if (TPILoad(TPI_CMD_SLDCS | REG_TPIIR, &identity))
+            break;
+    if (sReceiveError != XPRG_ERR_OK)
+        return TPITimeout();
+    if (identity != 0x80) {
+        sReceiveError = XPRG_ERR_FAILED;
+        return TPITimeout();
+    }
 
     /* Direction change guard time to 0 CLK bits */
-    TPIStore(TPI_CMD_SSTCS | REG_TPIPCR, GT2 | GT1 | GT0);
+    TPIStore(TPI_CMD_SSTCS | REG_TPIPCR, _BV(GT2) | _BV(GT1) | _BV(GT0));
 
     /* Enable access to the XPROG NVM bus by sending the documented NVM access key to the device */
     TPISendKey();
@@ -307,10 +310,14 @@ SMoTPI::EnterProgmode()
     uint8_t c;
     if (!TPILoad(TPI_CMD_SLD | POINTER_UNCHANGED, &c))
         return TPITimeout();
-    if (c < 0x90) // 512B Flash memory
+    if (c == 0x8F) // 512B Flash memory
         sPageMask = 1; // 2 bytes at a time
-    else // 2^(c & 0x0F) KB Flash memory
-        sPageMask = _BV((c & 0x0F) + 1) - 1; // 2^((c & 0x0F) + 1) bytes at a time 
+    else if (c >= 0x90 && c <= 0x92) // tiny10/20/40: 2/4/8 bytes per write
+        sPageMask = _BV((c & 0x0F) + 1) - 1;
+    else {
+        sReceiveError = XPRG_ERR_FAILED;
+        return TPITimeout();
+    }
 //-----------------------------------------------------------------------------------------------    
     XPRG_Body[1] = XPRG_ERR_OK;
     return 2;
@@ -358,7 +365,8 @@ SMoTPI::WriteMem()
     uint16_t numBytes = XPRG_Body[7] << 8 | XPRG_Body[8];
     uint8_t *data = &XPRG_Body[9];
 
-    int8_t writeSize = memcode == XPRG_MEM_TYPE_LOCKBITS ? 1 : sPageMask;
+    const uint8_t writeMask = (memcode == XPRG_MEM_TYPE_FUSE || memcode == XPRG_MEM_TYPE_LOCKBITS) ? 1 : sPageMask;
+    const uint16_t startAddress = uint16_t(XPRG_Body[5]) << 8 | XPRG_Body[6];
 
     TPIStore(TPI_CMD_SOUT(SMoXPROG::XPRGParam.NVMCMD), WORD_WRITE);
     if (numBytes & 1)
@@ -376,7 +384,7 @@ SMoTPI::WriteMem()
             TPIStore(TPI_CMD_SST | POINTER_POST_INC, *data++);
             i++;
             if (i == numBytes) {
-                while (i & sPageMask) { // write dummy bytes
+                while ((startAddress + i) & writeMask) { // write dummy bytes
                     TPISendIdle();
                     TPIStore(TPI_CMD_SST | POINTER_POST_INC, 0xFF);
                     i++;
@@ -385,7 +393,7 @@ SMoTPI::WriteMem()
                 }
                 break;
             }
-            if ((i & sPageMask) == 0)
+            if (((startAddress + i) & writeMask) == 0)
                 break;
             TPISendIdle();
         } while (1);
@@ -427,5 +435,7 @@ uint16_t
 SMoTPI::CRC()
 {
     XPRG_Body[1] = XPRG_ERR_FAILED;
-    return 5;
+    return 2;
 }
+
+void SMoTPI::Release() { TPIDisableTarget(); }

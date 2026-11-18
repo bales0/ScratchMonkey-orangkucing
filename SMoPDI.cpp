@@ -20,6 +20,9 @@
 #include "SMoConfig.h"
 #include "SMoXPROG.h"
 #include "SMoPDI.h"
+#include "SMoSerialFrame.h"
+
+static uint8_t sReceiveError = XPRG_ERR_OK;
 
 //                                 B0x10pidd x=rw, p=direct, i=postinc, dd=datasize
 #define PDI_CMD_LD                 B00100000
@@ -378,49 +381,30 @@ PDITransfer(uint8_t d, bool cont=false)
 /*
 * receive PDI 12-bit format byte data
 */
-static void
+static bool
 PDILoad(uint8_t c, uint8_t *p, uint8_t n)
 {
-    union {
-      uint32_t l;
-      uint8_t c[4];
-    } data;
-    uint8_t b;
- 
     PDITransfer(c, true);
     MOSI_TRISTATE();
-    SPI.transfer(0xFF); // # of guard clock bits = 8
-    data.c[1] = 0xFF;
+    SPI.transfer(0xFF); // eight direction-change guard clocks
+    SMoSerialFrameReader reader;
     do {
-        while (data.c[1] == 0xFF) // wait for the start bit
-            data.c[1] = SPI.transfer(0xFF);
-        b = 0;
-        data.c[0] = 0xFF; // sentinel
-        data.c[2] = SPI.transfer(0xFF);
-        // now the received 8 bit data is contained in data.l
-        while (data.c[1] != 0x7F) {
-            data.l <<= 1;
-            b++;
-        }
-        *p++ = data.c[2];
-        if (b > 3) {
-            data.c[2] = 0xFF;
-            data.c[3] |= B00000111; // overwrite parity bit and stop bits to 1
-            data.l >>= 8 + b;           
-        } else {
-            data.c[1] = SPI.transfer(0xFF) | B00000111 >> b;
-        }
+        sReceiveError = reader.Read(p++);
+        if (sReceiveError != XPRG_ERR_OK)
+            break;
     } while (n--);
+    // Restore the driver before restarting the idle clock generator.
     MOSI_ACTIVE();
     HeartBeatOn();
+    return sReceiveError == XPRG_ERR_OK;
 }
 
-static void
+static bool
 PDILoadS(uint8_t c, uint32_t a, uint8_t *p)
 {
     PDIStore(c, a & 0xFF);
     PDIStore((a >> 8) & 0xFF, (a >> 16) & 0xFF);
-    PDILoad((a >> 24) & 0xFF, p, 0);
+    return PDILoad((a >> 24) & 0xFF, p, 0);
 }
 
 static void
@@ -452,7 +436,7 @@ PDIEnableTarget(void)
     pinMode(MISO, INPUT);
     digitalWrite(MOSI, LOW);
     pinMode(MOSI, OUTPUT);    // specify the data direction of MOSI and SCK to become SPI master
-    pinMode(SCK, LOW);
+    digitalWrite(SCK, LOW);
     pinMode(SCK, OUTPUT);
 #if defined(MOSI_GATE)
     pinMode(MOSI_GATE, OUTPUT);
@@ -472,6 +456,13 @@ PDIDisableTarget(void)
     DisableHeartBeat();
     SPI.endTransaction();
     SPI.end();
+    MOSI_TRISTATE();
+    digitalWrite(MOSI, LOW); // no pullup through the direct 510-ohm connection
+    pinMode(MOSI, INPUT);
+    pinMode(SCK, INPUT);
+#if SMO_LAYOUT==SMO_LAYOUT_HVPROG2
+    digitalWrite(SMO_HVENABLE, LOW);
+#endif
 }
 
 static bool
@@ -483,7 +474,8 @@ WaitUntilNVMActive(void)
     do {
         if (millis() - time > DEFAULTTIMEOUT)
             return false;
-        PDILoad(PDI_CMD_LDCS | REG_STATUS, &s, 0);
+        if (!PDILoad(PDI_CMD_LDCS | REG_STATUS, &s, 0))
+            return false;
     } while (!(s & _BV(NVMEN)));
     return true;
 }
@@ -497,7 +489,8 @@ WaitWhileNVMControllerBusy(void)
         if (millis() - time > DEFAULTTIMEOUT)
             return false;
         // in order to preserve the PDI pointer register we use direct addressing
-        PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_STATUS, &s);
+        if (!PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_STATUS, &s))
+            return false;
     } while (s & _BV(NVMBSY));
     return true;
 }
@@ -507,8 +500,7 @@ WaitWhileNVMControllerBusy(void)
 uint16_t
 SMoPDI::EnterProgmode()
 {
-    uint8_t s;
-    
+    sReceiveError = XPRG_ERR_OK;
     PDIEnableTarget();
     /* Direction change guard time to 8 CLK bits */
     PDIStore(PDI_CMD_STCS | REG_CTRL, _BV(GT2));
@@ -520,7 +512,8 @@ SMoPDI::EnterProgmode()
     return 2;
     
 EnterProgmodeERROR:
-    XPRG_Body[1] = XPRG_ERR_TIMEOUT;
+    PDIDisableTarget();
+    XPRG_Body[1] = sReceiveError == XPRG_ERR_FAILED ? XPRG_ERR_FAILED : XPRG_ERR_TIMEOUT;
     return 2;
 }
 
@@ -586,7 +579,7 @@ SMoPDI::Erase()
     }
     if (command == CHIP_ERASE) {
         if (!WaitUntilNVMActive()) {
-            XPRG_Body[1] = XPRG_ERR_TIMEOUT;
+            XPRG_Body[1] = sReceiveError == XPRG_ERR_FAILED ? XPRG_ERR_FAILED : XPRG_ERR_TIMEOUT;
             return 2;
         }
     }
@@ -639,104 +632,76 @@ new packet has the write page bit set.
 uint16_t
 SMoPDI::WriteMem()
 {
-    uint8_t memcode = XPRG_Body[1];
-    uint8_t mode = XPRG_Body[2];
-    SMoGeneral::gAddress.c[3] = XPRG_Body[3];
-    SMoGeneral::gAddress.c[2] = XPRG_Body[4];
-    SMoGeneral::gAddress.c[1] = XPRG_Body[5];
-    SMoGeneral::gAddress.c[0] = XPRG_Body[6];
-    uint16_t numBytes = XPRG_Body[7] << 8 | XPRG_Body[8];
-    uint8_t *data = &XPRG_Body[9];
-    
-    uint8_t command = LOAD_FLASH_BUFFER;
-    uint8_t erase = ERASE_FLASH_BUFFER;
-    uint8_t commit;
-    uint16_t pageMask = 0;
+    const uint8_t memcode = XPRG_Body[1];
+    const uint8_t mode = XPRG_Body[2];
+    uint32_t address = (uint32_t)XPRG_Body[3] << 24 |
+        (uint32_t)XPRG_Body[4] << 16 | (uint16_t)XPRG_Body[5] << 8 | XPRG_Body[6];
+    uint16_t count = (uint16_t)XPRG_Body[7] << 8 | XPRG_Body[8];
+    const uint8_t *data = &XPRG_Body[9];
+    uint8_t load = LOAD_FLASH_BUFFER, commit = WRITE_USER_SIG_ROW;
+    uint16_t pageSize = SMoXPROG::XPRGParam.FlashPageSize;
+    const bool paged = memcode == XPRG_MEM_TYPE_APPL || memcode == XPRG_MEM_TYPE_BOOT ||
+        memcode == XPRG_MEM_TYPE_EEPROM || memcode == XPRG_MEM_TYPE_USERSIG;
     switch (memcode) {
-    /* no XPRG memcode for the following command (non-functional for XMEGA-A1)
-        commit = mode & _BV(XPRG_MEM_WRITE_ERASE) ? ERASE_WRITE_APP_FLASH : WRITE_APP_FLASH;
-        pageMask = SMoXPROG::XPRGParam.FlashPageSize - 1;
-        break; */
     case XPRG_MEM_TYPE_APPL:
         commit = mode & _BV(XPRG_MEM_WRITE_ERASE) ? ERASE_WRITE_APP_PAGE : WRITE_APP_PAGE;
-        pageMask = SMoXPROG::XPRGParam.FlashPageSize - 1;
         break;
     case XPRG_MEM_TYPE_BOOT:
         commit = mode & _BV(XPRG_MEM_WRITE_ERASE) ? ERASE_WRITE_BOOT_PAGE : WRITE_BOOT_PAGE;
-        pageMask = SMoXPROG::XPRGParam.FlashPageSize - 1;
         break;
     case XPRG_MEM_TYPE_EEPROM:
-        command = LOAD_EEPROM_BUFFER;
-        erase = ERASE_EEPROM_BUFFER;
+        load = LOAD_EEPROM_BUFFER;
+        pageSize = SMoXPROG::XPRGParam.EEPageSize;
         commit = mode & _BV(XPRG_MEM_WRITE_ERASE) ? ERASE_WRITE_EEPROM_PAGE : WRITE_EEPROM_PAGE;
-        pageMask = SMoXPROG::XPRGParam.EEPageSize - 1;
-        break;
-    case XPRG_MEM_TYPE_FUSE:
-        command = WRITE_FUSES;
-        break;
-    case XPRG_MEM_TYPE_LOCKBITS:
-        command = WRITE_LOCK_BITS;
         break;
     case XPRG_MEM_TYPE_USERSIG:
-        command = WRITE_USER_SIG_ROW;
+        break;
+    case XPRG_MEM_TYPE_FUSE:
+        load = WRITE_FUSES;
+        break;
+    case XPRG_MEM_TYPE_LOCKBITS:
+        load = WRITE_LOCK_BITS;
         break;
     default:
         XPRG_Body[1] = XPRG_ERR_FAILED;
         return 2;
     }
-
-    if (pageMask) {
-        uint32_t startAddress = SMoGeneral::gAddress.l;
-        uint8_t sendMask = pageMask > 0xFF ? 0xFF : pageMask;
-        if (numBytes & 1)
-            data[numBytes++] = 0xFF; // always transfer even bytes
-        //
-        // load page buffer
-        //
-        // Note: We don't need to erase page buffer since it is automatically erased after:
-        //     1. A device reset
-        //     2. Executing the WRITE_XXXX_PAGE or ERASE_WRITE_XXXX_PAGE command
-        //     3. Executing the WRITE_USER_SIG_ROW or WRITE_LOCK_BITS command
-        //
-        PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_CMD); PDITransfer(command);
-        PDIStoreS(PDI_CMD_ST | POINTER_REG | Data32_t, SMoGeneral::gAddress.l);
-        do {
-            PDIStore(PDI_CMD_REPEAT | Data8_t, sendMask - (uint8_t)(SMoGeneral::gAddress.l & sendMask));
-            PDITransfer(PDI_CMD_ST | POINTER_POST_INC | Data8_t);
-            do {
-                if (numBytes) {
-                    PDIStore(*data, *(data+1));
-                    data += 2;
-                    numBytes -= 2;
-                } else {
-                    PDIStore(0xFF, 0xFF);
-                }
-                SMoGeneral::gAddress.l += 2;
-            } while (SMoGeneral::gAddress.l & sendMask);
-            if (!WaitWhileNVMControllerBusy())
-                goto WriteMemERROR;
-            if ((numBytes == 0 || !(SMoGeneral::gAddress.l & pageMask)) && mode & _BV(XPRG_MEM_WRITE_WRITE)) {
-                // write page
-                PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_CMD); PDITransfer(commit);
-                PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, startAddress); PDITransfer(0x55); // dummy write
-                if (!WaitWhileNVMControllerBusy())
-                    goto WriteMemERROR;
-            }
-        } while (numBytes);
-    } else { // Byte mode
-        PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_CMD); PDITransfer(command);
-        PDIStoreS(PDI_CMD_ST | POINTER_REG | Data32_t, SMoGeneral::gAddress.l);            
-        do {
+    if (!WaitWhileNVMControllerBusy())
+        goto WriteMemERROR;
+    while (count) {
+        const uint32_t start = address;
+        uint16_t block = count;
+        if (paged && pageSize) {
+            const uint16_t available = pageSize - (address & (pageSize - 1));
+            if (block > available) block = available;
+        }
+        // The NVM buffer survives successive WRITE_MEM packets. Do not pad or
+        // commit an intermediate 256-byte fragment of a 512-byte page.
+        PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_CMD);
+        PDITransfer(load);
+        PDIStoreS(PDI_CMD_ST | POINTER_REG | Data32_t, address);
+        for (uint16_t i = 0; i < block; ++i)
             PDIStore(PDI_CMD_ST | POINTER_POST_INC | Data8_t, *data++);
+        address += block;
+        count -= block;
+        if (paged && (address & 1) && memcode != XPRG_MEM_TYPE_EEPROM)
+            PDIStore(PDI_CMD_ST | POINTER_POST_INC | Data8_t, 0xFF);
+        if (!WaitWhileNVMControllerBusy())
+            goto WriteMemERROR;
+        if (paged && (mode & _BV(XPRG_MEM_WRITE_WRITE))) {
+            PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_CMD);
+            PDITransfer(commit);
+            PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, start);
+            PDITransfer(0x55);
             if (!WaitWhileNVMControllerBusy())
                 goto WriteMemERROR;
-        } while (--numBytes);
-    }    
+        }
+    }
+    SMoGeneral::gAddress.l = address;
     XPRG_Body[1] = XPRG_ERR_OK;
     return 2;
-
 WriteMemERROR:
-    XPRG_Body[1] = XPRG_ERR_TIMEOUT;
+    XPRG_Body[1] = sReceiveError == XPRG_ERR_FAILED ? XPRG_ERR_FAILED : XPRG_ERR_TIMEOUT;
     return 2;
 }
 
@@ -778,7 +743,10 @@ SMoPDI::ReadMem()
     PDIStoreS(PDI_CMD_ST | POINTER_REG | Data32_t, SMoGeneral::gAddress.l);
     if (numBytes > 1)
         PDIStore(PDI_CMD_REPEAT | Data8_t, numBytes - 1);
-    PDILoad(PDI_CMD_LD | POINTER_POST_INC | Data8_t, &XPRG_Body[2], numBytes - 1);
+    if (!PDILoad(PDI_CMD_LD | POINTER_POST_INC | Data8_t, &XPRG_Body[2], numBytes - 1)) {
+        XPRG_Body[1] = sReceiveError;
+        return 2;
+    }
 
     XPRG_Body[1] = XPRG_ERR_OK;
     return numBytes + 2;
@@ -790,7 +758,7 @@ SMoPDI::CRC()
     uint8_t type = XPRG_Body[1];
     uint8_t *outData = &XPRG_Body[2];
     
-    uint8_t command, b;
+    uint8_t command;
     switch (type) {
     case XPRG_CRC_APP:
         command = APP_CRC;
@@ -808,15 +776,20 @@ SMoPDI::CRC()
 
     PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_CMD); PDITransfer(command);
     PDIStoreS(PDI_CMD_STS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_CTRLA); PDITransfer(_BV(CMDEX));
-    if (command == FLASH_CRC && !WaitUntilNVMActive() || !WaitWhileNVMControllerBusy())
+    if ((command == FLASH_CRC && !WaitUntilNVMActive()) || !WaitWhileNVMControllerBusy())
         goto CRCERROR;
-    PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_DATA2, outData++);
-    PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_DATA1, outData++);
-    PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_DATA0, outData++);
+    if (!PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_DATA2, outData++))
+        goto CRCERROR;
+    if (!PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_DATA1, outData++))
+        goto CRCERROR;
+    if (!PDILoadS(PDI_CMD_LDS | Addr32_t | Data8_t, SMoXPROG::XPRGParam.NVMBase + NVMREG_DATA0, outData++))
+        goto CRCERROR;
     XPRG_Body[1] = XPRG_ERR_OK;
     return 5;
 
 CRCERROR:
-    XPRG_Body[1] = XPRG_ERR_TIMEOUT;
+    XPRG_Body[1] = sReceiveError == XPRG_ERR_FAILED ? XPRG_ERR_FAILED : XPRG_ERR_TIMEOUT;
     return 2;
 }
+
+void SMoPDI::Release() { PDIDisableTarget(); }

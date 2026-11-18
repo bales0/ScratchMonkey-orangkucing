@@ -23,6 +23,7 @@
 #include "SMoGeneral.h"
 #include "SMoCommand.h"
 #include "SMoConfig.h"
+#include "SMoSafety.h"
 #ifdef DEBUG_ISP
 #include "SMoDebug.h"
 #endif
@@ -157,7 +158,7 @@ static bool
 ISPPollReady()
 {
     uint32_t time = millis();
-    while (!SPITransaction(0xF0, 0, 0, 0)) // Poll RDY/BSY
+    while (SPITransaction(0xF0, 0, 0, 0) & 1) // bit 0 is one while busy
         if (millis() - time > DEFAULTTIMEOUT)
             return false;
     return true;
@@ -190,6 +191,7 @@ SMoISP::EnterProgmode()
     digitalWrite(SMO_HVENABLE, LOW);
     pinMode(SMO_HVENABLE, OUTPUT);
 #endif
+    SMoStopClock();
     // to avoid glitch in SCK and MOSI we must set CPOL before SPI.begin()
     SPCR &= ~_BV(CPOL) & ~_BV(CPHA); // idle LOW for SPI_MODE0
     //
@@ -263,6 +265,7 @@ SMoISP::EnterProgmode()
             response     = SPITransaction(command, pollIndex-1);
         } while (response != pollValue && sSPILimpMode++ < kMaxLimp);
     }
+    if (response != pollValue) Release();
     SMoCommand::SendResponse(response==pollValue ? STATUS_CMD_OK : STATUS_CMD_FAILED);
 }
 
@@ -293,6 +296,8 @@ SMoISP::LeaveProgmode()
     TCCR1A = 0;
 #endif
     delay(postDelay);
+    pinMode(MOSI, INPUT);
+    pinMode(SCK, INPUT);
     SMoCommand::SendResponse();
 }
 
@@ -306,6 +311,7 @@ SMoISP::ChipErase()
     SPITransaction(command);
     if (pollMethod) {
         if (!ISPPollReady()) {
+            Release();
             SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
             return;
         }
@@ -340,9 +346,15 @@ ProgramMemory(bool flash)
             else if (mode & 0x24) { // Value polling
                 if (pollVal == *data)
                     delay(cmdDelay); // Values are identical - don't poll
-                else
+                else {
+                    const uint32_t started = millis();
+                    // Honor the target write delay, with a conservative floor
+                    // for legacy configurations whose cmdDelay is zero.
+                    const uint16_t timeout = cmdDelay > DEFAULTTIMEOUT ? cmdDelay : DEFAULTTIMEOUT;
                     while (SPITransaction(!(numBytes & 1) || !flash ? cmd3 : cmd3|8, SMoGeneral::gAddress.c[1], SMoGeneral::gAddress.c[0], 0) == pollVal)
-                        ;
+                        if ((uint32_t)(millis() - started) >= timeout)
+                            goto TIMEOUT_ProgramMemory;
+                }
             } else if (mode & 0x48 && !ISPPollReady()) // RDY/BSY polling
                 goto TIMEOUT_ProgramMemory;
         }
@@ -358,6 +370,7 @@ ProgramMemory(bool flash)
     SMoCommand::SendResponse();
     return;
 TIMEOUT_ProgramMemory:
+    SMoISP::Release();
     SMoCommand::SendResponse(STATUS_RDY_BSY_TOUT);
 }
 
@@ -376,7 +389,7 @@ ReadMemory(bool flash)
             SMoGeneral::gAddress.d.addr++;
             if (!numBytes)
                 break;
-            if (SMoGeneral::gAddress.c[0] == 0)
+            if (SMoGeneral::gAddress.d.addr == 0)
                 SPITransaction(0x4D, 0, ++SMoGeneral::gAddress.d.extL, 0); // Load Extended Address byte
         }
     } while (numBytes);
@@ -413,7 +426,7 @@ SMoISP::ProgramFuse()
 {
     SPITransaction(&SMoCommand::gBody[1]);
     SMoCommand::gBody[2] = STATUS_CMD_OK;
-    SMoCommand::SendResponse();
+    SMoCommand::SendResponse(STATUS_CMD_OK, 3);
 }
 
 void
@@ -428,53 +441,30 @@ SMoISP::ReadFuse()
 void
 SMoISP::SPIMulti()
 {
-    uint8_t         numTX   =   SMoCommand::gBody[1];
-    uint8_t         numRX   =   SMoCommand::gBody[2];
-    uint8_t         rxStart =   SMoCommand::gBody[3];
-    const uint8_t * txData  =  &SMoCommand::gBody[4];
-    uint8_t *       rxData  =  &SMoCommand::gBody[2];
+    const uint8_t numTX = SMoCommand::gBody[1];
+    const uint8_t numRX = SMoCommand::gBody[2];
+    const uint8_t rxStart = SMoCommand::gBody[3];
+    uint16_t total = uint16_t(rxStart) + numRX;
+    if (total < numTX) total = numTX;
+    for (uint16_t i = 0; i < total; ++i) {
+        uint8_t value = SPITransfer(i < numTX ? SMoCommand::gBody[4+i] : 0);
+        if (i >= rxStart && i < uint16_t(rxStart) + numRX)
+            SMoCommand::gBody[2+i-rxStart] = value;
+    }
+    SMoCommand::gBody[2+numRX] = STATUS_CMD_OK;
+    SMoCommand::SendResponse(STATUS_CMD_OK, 3+numRX);
+}
 
-#ifdef DEBUG_ISP
-    SMoDebug.print("!SPI");
-#endif
-    while (numTX) {
-#ifdef DEBUG_ISP
-        SMoDebug.print(" ");
-        SMoDebug.print(*txData, HEX);
-#endif
-        *rxData = SPITransfer(*txData++);
-        --numTX;
-#ifdef DEBUG_ISP
-        SMoDebug.print(rxStart ? " (" : " [");
-        SMoDebug.print(*rxData, HEX);
-        SMoDebug.print(rxStart ? ")" : "]");
-#endif
-        if (rxStart) {
-            --rxStart;
-        } else if (numRX) {
-            ++rxData;
-            --numRX;
-        }
-    }
-    while (numRX) {
-        *rxData = SPITransfer(0);
-#ifdef DEBUG_ISP
-        SMoDebug.print(rxStart ? " . (" : " . [");
-        SMoDebug.print(*rxData, HEX);
-        SMoDebug.print(rxStart ? ")" : "]");
-#endif
-        if (rxStart) {
-            --rxStart;
-        } else {
-            ++rxData;
-            --numRX;
-        }
-    }
-    *rxData++ = STATUS_CMD_OK;
-    SMoCommand::SendResponse(STATUS_CMD_OK, rxData-&SMoCommand::gBody[0]);
-#ifdef DEBUG_ISP
-    SMoDebug.println();
-#endif
+void SMoISP::Release()
+{
+    SPI.endTransaction();
+    SPI.end();
+    SMoStopClock();
+    sSPILimpMode = false;
+    ISPDeassertReset();
+    pinMode(MOSI, INPUT);
+    pinMode(SCK, INPUT);
+    SMoCommand::gProgrammingMode = 0;
 }
 
 //

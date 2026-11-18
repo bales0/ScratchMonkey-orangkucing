@@ -4,6 +4,8 @@
 #include <deque>
 #include <vector>
 #include <array>
+#include <cstring>
+#include <utility>
 #define B00100000 0b00100000
 #define B01100000 0b01100000
 #define B01101000 0b01101000
@@ -28,27 +30,73 @@
 #define TCCR2 mockTCCR2
 #define TIMER2_COMP_vect mockTimerInterrupt
 #define ISR(name) void name()
-inline uint8_t mockTCCR2, TCNT2, OCR2, TIMSK, DDRB, PORTB, SPCR, SPDR;
-enum { WGM21=3, CS21=1, OCIE2=7, SPE=6 };
+enum class MockPortOperation { DataDirection, ControlSignals, DataRead, SerialWrite };
+struct MockPortEvent {
+    MockPortOperation operation;
+    uint8_t value;
+};
+inline bool mockPortTraceEnabled=false;
+inline std::vector<MockPortEvent> mockPortTrace;
+inline void mockTrace(MockPortOperation operation, uint8_t value) {
+    if(mockPortTraceEnabled) mockPortTrace.push_back({operation,value});
+}
+struct MockRegister {
+    MockPortOperation operation;
+    bool traceRead=false;
+    uint8_t value=0;
+    operator uint8_t() const {
+        if(traceRead) mockTrace(operation,value);
+        return value;
+    }
+    MockRegister &operator=(uint8_t next) {
+        value=next;
+        if(!traceRead) mockTrace(operation,value);
+        return *this;
+    }
+    MockRegister &operator|=(unsigned int bits) { return *this=uint8_t(value|bits); }
+    MockRegister &operator&=(unsigned int bits) { return *this=uint8_t(value&bits); }
+};
+inline MockRegister DDRB{MockPortOperation::DataDirection};
+inline MockRegister PORTC{MockPortOperation::ControlSignals};
+inline MockRegister PINB{MockPortOperation::DataRead,true};
+inline uint8_t mockTCCR2, TCNT2, OCR2, TIMSK, PORTB, PORTD, DDRC, PINC, SPCR, SPDR;
+enum { WGM21=3, CS21=1, OCIE2=7, SPE=6, CPOL=3, CPHA=2, COM20=4 };
 enum { LOW=0, HIGH=1, INPUT=0, OUTPUT=1, MOSI=5, MISO=6, SCK=7, SS=4 };
 inline uint32_t mockTime=0, mockTick=1;
 inline std::array<int, 64> mockPins{};
+inline std::array<int, 64> mockPinModes{};
+inline unsigned mockGPIO=0;
+inline bool mockPinTraceEnabled=false;
+inline std::vector<std::pair<int,int>> mockPinWrites;
+inline int mockADC=-1;
 inline uint32_t millis() { uint32_t now=mockTime; mockTime+=mockTick; return now; }
 inline void delay(unsigned long ms) { mockTime+=ms; }
 inline void delayMicroseconds(unsigned int) {}
-inline void pinMode(int, int) {}
-inline void digitalWrite(int pin, int value) { mockPins.at(pin)=value; }
-inline void analogWrite(int pin, int value) { mockPins.at(pin)=value; }
+inline void pinMode(int pin, int mode) { ++mockGPIO; mockPinModes.at(pin)=mode; }
+inline void digitalWrite(int pin, int value) {
+    ++mockGPIO;
+    mockPins.at(pin)=value;
+    if(mockPinTraceEnabled) mockPinWrites.emplace_back(pin,value);
+}
+inline void analogWrite(int pin, int value) { ++mockGPIO; mockPins.at(pin)=value; }
 inline int digitalRead(int pin) { return mockPins.at(pin); }
-inline int analogRead(int) { return 0; }
+inline int analogRead(int) { return mockADC >= 0 ? mockADC : (mockPins[13] ? 820 : 0); }
 inline void noInterrupts() {}
 inline void interrupts() {}
 struct SerialMock {
     std::deque<uint8_t> input;
     std::vector<uint8_t> output;
+    void begin(unsigned long) {}
     int available() { return !input.empty(); }
     int read() { int b=input.front(); input.pop_front(); return b; }
-    size_t write(uint8_t b) { output.push_back(b); return 1; }
-    size_t write(const uint8_t *p, size_t n) { output.insert(output.end(),p,p+n); return n; }
+    size_t write(uint8_t b) {
+        mockTrace(MockPortOperation::SerialWrite,b);
+        output.push_back(b);
+        return 1;
+    }
+    size_t write(const uint8_t *p, size_t n) {
+        for(size_t i=0;i<n;++i) write(p[i]);
+        return n;
+    }
 };
 inline SerialMock Serial;

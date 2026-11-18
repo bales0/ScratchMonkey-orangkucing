@@ -36,10 +36,17 @@
 #include "SMoHVSP.h"
 #include "SMoHVPP.h"
 #include "SMoXPROG.h"
+#include "SMoSafety.h"
 
 void
 setup()
 {
+#if SMO_LAYOUT==SMO_LAYOUT_HVPROG2
+    // T2 enables the MAX662 by pulling SHDN low. Drive it off explicitly;
+    // do not leave the base floating until the first programming command.
+    digitalWrite(SMO_HVENABLE, LOW);
+    pinMode(SMO_HVENABLE, OUTPUT);
+#endif
     Serial.begin(115200);
 #if SMO_LAYOUT==SMO_LAYOUT_HVPROG2
     analogWrite(SMO_SVCC, FIVEVOLT); // 5V
@@ -52,7 +59,30 @@ setup()
 void
 loop()
 {
-    switch (SMoCommand::GetNextCommand()) {
+    const int command = SMoCommand::GetNextCommand();
+    if (command > 0 && !SMoCommand::ValidRequest()) {
+        SMoCommand::SendResponse(STATUS_CMD_FAILED);
+        return;
+    }
+    // AVRDUDE re-enters the same protocol after chip erase. Release the old
+    // peripheral ownership before repeating that protocol's entry sequence.
+    if (command == SMoCommand::gProgrammingMode &&
+        (command == CMD_ENTER_PROGMODE_ISP || command == CMD_ENTER_PROGMODE_PP ||
+         command == CMD_ENTER_PROGMODE_HVSP || command == CMD_ENTER_PROGMODE_HVSP_STK600)) {
+        if (command == CMD_ENTER_PROGMODE_ISP) SMoISP::Release();
+        else SMoAbortHV();
+    }
+    if (command > 0 && !SMoCommand::CheckSession()) {
+        SMoCommand::SendResponse(STATUS_CMD_FAILED);
+        return;
+    }
+    if (!SMoCommand::gProgrammingMode &&
+        (command == CMD_LEAVE_PROGMODE_ISP || command == CMD_LEAVE_PROGMODE_PP ||
+         command == CMD_LEAVE_PROGMODE_HVSP || command == CMD_LEAVE_PROGMODE_HVSP_STK600)) {
+        SMoCommand::SendResponse();
+        return;
+    }
+    switch (command) {
         //
         // General commands
         //

@@ -35,6 +35,7 @@
 #define _SMO_TPI_
 
 namespace SMoTPI {
+    void Release();
     extern uint16_t EnterProgmode();
     extern uint16_t LeaveProgmode();
     extern uint16_t Erase();
