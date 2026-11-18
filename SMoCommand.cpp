@@ -27,6 +27,7 @@ static uint8_t  sSequenceNumber;
 static uint16_t sNumBytesRead       = 0;
 static uint16_t sNumBytesWanted     = 1;
 static uint8_t  sCheckSum           = 0;
+static uint32_t sLastByteTime       = 0;
 
 uint16_t SMoCommand::gSize;
 uint8_t  SMoCommand::gBody[kMaxBodySize+1];
@@ -54,8 +55,13 @@ ResetToIdle()
 int 
 SMoCommand::GetNextCommand()
 {
+    // Discard a stalled frame before consuming a possible new MESSAGE_START.
+    if ((sState == kHeaderState || sState == kBodyState) &&
+        (uint32_t)(millis() - sLastByteTime) >= DEFAULTTIMEOUT)
+        ResetToIdle();
     if (!Serial.available() || sState == kCompleteState)
         return kIncomplete;
+    sLastByteTime = millis();
     sCheckSum ^= (gBody[sNumBytesRead++] = Serial.read());
     if (sNumBytesRead < sNumBytesWanted)
         return kIncomplete;
@@ -75,7 +81,7 @@ SMoCommand::GetNextCommand()
         if (gBody[4] != TOKEN)
             goto reportHeaderError;
         sNumBytesWanted = gBody[2] << 8 | gBody[3];
-        if (sNumBytesWanted > kMaxBodySize)
+        if (!sNumBytesWanted || sNumBytesWanted > kMaxBodySize)
             goto reportHeaderError;
         sState          = kBodyState;
         sSequenceNumber = gBody[1];

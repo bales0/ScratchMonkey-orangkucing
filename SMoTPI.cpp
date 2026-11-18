@@ -128,7 +128,7 @@ TPITransfer(uint8_t c)
 * receive TPI 12-bit format byte data
 * via SPI 3 bytes (24 clocks)
 */
-static void
+static bool
 TPILoad(uint8_t c, uint8_t *p)
 {
     union {
@@ -136,8 +136,12 @@ TPILoad(uint8_t c, uint8_t *p)
       uint8_t c[4];
     } data;
 
+    data.l = 0;
     TPITransfer(c);
+    uint32_t started = millis();
     do { // wait for the start bit
+        if ((uint32_t)(millis() - started) >= DEFAULTTIMEOUT)
+            return false;
         data.c[1] = SPI.transfer(0xFF);
     } while (data.c[1] == 0xFF);
     data.c[0] = 0xFF; // sentinel
@@ -149,6 +153,7 @@ TPILoad(uint8_t c, uint8_t *p)
     while (data.c[1] != 0x7F)
         data.l <<= 1;
     *p = data.c[2];
+    return true;
 }
 
 static void
@@ -247,13 +252,22 @@ TPIDisableTarget(void)
 #endif
 }
 
+static uint16_t
+TPITimeout()
+{
+    TPIDisableTarget();
+    XPRG_Body[1] = XPRG_ERR_TIMEOUT;
+    return 2;
+}
+
 static bool
 WaitWhileNVMControllerBusy(void)
 {
     uint8_t s;
     uint32_t time = millis();
     do {
-        TPILoad(TPI_CMD_SIN(SMoXPROG::XPRGParam.NVMCSR), &s);
+        if (!TPILoad(TPI_CMD_SIN(SMoXPROG::XPRGParam.NVMCSR), &s))
+            return false;
         if (millis() - time > DEFAULTTIMEOUT)
             return false;
     } while (s & _BV(NVMBSY));
@@ -276,9 +290,12 @@ SMoTPI::EnterProgmode()
 
     /* Wait until the NVM bus becomes active */
     uint8_t s;
+    uint32_t started = millis();
     do {
         /* Send the SLDCS command to read the TPI STATUS register to see the NVM bus is active */
-        TPILoad(TPI_CMD_SLDCS | REG_TPISR, &s);
+        if ((uint32_t)(millis() - started) >= DEFAULTTIMEOUT ||
+            !TPILoad(TPI_CMD_SLDCS | REG_TPISR, &s))
+            return TPITimeout();
     } while (!(s & _BV(NVMEN)));
 
  //-----------------------------------------------------------------------------------------------   
@@ -288,7 +305,8 @@ SMoTPI::EnterProgmode()
     TPIStore(TPI_CMD_SSTPR | 1, 0x3F);
 
     uint8_t c;
-    TPILoad(TPI_CMD_SLD | POINTER_UNCHANGED, &c);
+    if (!TPILoad(TPI_CMD_SLD | POINTER_UNCHANGED, &c))
+        return TPITimeout();
     if (c < 0x90) // 512B Flash memory
         sPageMask = 1; // 2 bytes at a time
     else // 2^(c & 0x0F) KB Flash memory
@@ -322,7 +340,9 @@ SMoTPI::Erase()
     TPIStore(TPI_CMD_SSTPR | 1, XPRG_Body[4]);
     TPIStore(TPI_CMD_SST | POINTER_UNCHANGED, 0x55); // dummy write
 
-    XPRG_Body[1] = WaitWhileNVMControllerBusy() ? XPRG_ERR_OK : XPRG_ERR_TIMEOUT;
+    if (!WaitWhileNVMControllerBusy())
+        return TPITimeout();
+    XPRG_Body[1] = XPRG_ERR_OK;
     return 2;
 }
 
@@ -369,10 +389,8 @@ SMoTPI::WriteMem()
                 break;
             TPISendIdle();
         } while (1);
-        if (!WaitWhileNVMControllerBusy()) {
-            XPRG_Body[1] = XPRG_ERR_TIMEOUT;
-            return 2;
-        }        
+        if (!WaitWhileNVMControllerBusy())
+            return TPITimeout();
     } while (i < numBytes);
 
     XPRG_Body[1] = XPRG_ERR_OK;
@@ -398,7 +416,8 @@ SMoTPI::ReadMem()
     TPIStore(TPI_CMD_SSTPR | 1, XPRG_Body[4]);
 
     for (uint16_t i = 0; i < numBytes; i++) {
-        TPILoad(TPI_CMD_SLD | POINTER_POST_INC, outData++);
+        if (!TPILoad(TPI_CMD_SLD | POINTER_POST_INC, outData++))
+            return TPITimeout();
     }
     XPRG_Body[1] = XPRG_ERR_OK;
     return numBytes + 2;

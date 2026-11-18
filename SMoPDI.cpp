@@ -736,7 +736,7 @@ SMoPDI::WriteMem()
     return 2;
 
 WriteMemERROR:
-    XPRG_Body[2] = XPRG_ERR_TIMEOUT;
+    XPRG_Body[1] = XPRG_ERR_TIMEOUT;
     return 2;
 }
 
