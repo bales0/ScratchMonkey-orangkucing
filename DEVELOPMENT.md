@@ -10,7 +10,9 @@ schematic. Its generic MEGA8535-P symbol does not identify the fitted MCU.
 HVprog2-specific code already exists: SMO_LAYOUT_HVPROG2 selects voltage
 control, reset polarity, direct parallel control/data ports, and timer logic.
 ATmega32 already selects this layout in SMoConfig.h, so no firmware source
-changes are needed for this setup. Runtime behavior has not been hardware-tested.
+changes are needed for selecting this layout. Earlier ISP reads and the owner's
+working HVSP ATtiny13 connection are recorded in [STABILIZATION.md](STABILIZATION.md).
+The new idle-shutdown firmware has not been uploaded or physically accepted.
 
 ## Setup
 
@@ -50,16 +52,18 @@ $env:PYTHONIOENCODING = "utf-8"
 The complete firmware builds successfully for ATmega32 with AVR GCC 7.3.0,
 MightyCore 3.0.2 and the configured 7.3728 MHz clock:
 
-- Flash: 12950 / 32768 bytes (39.5%).
-- Static RAM: 541 / 2048 bytes (26.4%); stack usage is additional.
-- Output: .pio/build/hvprog2/firmware.hex and firmware.elf.
-- Build log: .pio/hvprog2-build.log.
+- Stabilization build, 2026-11-19: Flash 15682 / 32768 bytes (47.9%).
+- Static RAM: 557 / 2048 bytes (27.2%); stack usage is additional.
+- Default output: .pio/build/hvprog2/firmware.hex and firmware.elf.
+- This acceptance used `PLATFORMIO_BUILD_DIR=.pio/build-stabilization`, so its
+  artifacts are .pio/build-stabilization/hvprog2/firmware.hex and firmware.elf.
+- Build log: .pio/stabilization/firmware-build.log.
 
 The previous flash overflow concerned the incorrectly selected ATmega8535 and
 does not apply to this ATmega32 build. All existing protocols remain enabled.
-The compiler reports existing warnings about expression parentheses and unused
-variables. Hardware protocols, voltage control and runtime stack usage remain
-unverified.
+The acceptance build completed without compiler warnings. Physical timing,
+voltage transitions, runtime stack usage and TPI/PDI targets require manual
+acceptance; protocol simulations do not establish electrical safety.
 
 ## Author reference and host compatibility
 
@@ -69,8 +73,10 @@ an external 7.3728 MHz clock and Standard pinout. These match platformio.ini.
 
 For TPI/PDI, the article describes host-side AVRDUDE changes for XPROG support,
 memory-size reporting and TPI fuse handling, with links to patched forks.
-Firmware support alone does not establish compatibility with the installed
-AVRDUDE version. That client has not been checked as part of this setup.
+Public AVRDUDE 8.3 and the local fork have now been tested against the compiled
+firmware with simulated targets. The profiles, exact test commands, distinction
+between simulation and hardware, and the XPROG extension are documented in
+[STABILIZATION.md](STABILIZATION.md).
 
 The article concerns a modified original STK500. Its component-removal steps
 and J200 connector refer to that board; use the supplied HVprog2 schematic
@@ -94,9 +100,9 @@ the original Arduino wiring.
 
 ## Upstream and host patch review
 
-See [the compatibility review](doc/UPSTREAM_REVIEW.md) for the pinned upstream
-and gist revisions, differences between the two AVRDUDE patches, and remaining
-host compatibility checks. The HVprog2 fork remains the development baseline.
+See [the stabilization report](STABILIZATION.md) for source HEADs, public AVRDUDE
+8.3 provenance, historical patch differences and remaining hardware checks.
+Only the existing `hvprog2` ATmega32 environment is used; no build profiles were added.
 
 ## References
 

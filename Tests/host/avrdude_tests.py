@@ -1,6 +1,8 @@
 """Exercise the real AVRDUDE against a loopback-only STK500v2 simulator."""
 import argparse
+import json
 import re
+import queue
 from pathlib import Path
 import socket
 import subprocess
@@ -63,7 +65,10 @@ class Programmer:
                         checksum = 0
                         for value in response:
                             checksum ^= value
-                        conn.sendall(response + bytes([checksum]))
+                        framed = response + bytes([checksum])
+                        conn.sendall(framed)
+                        if self.fault == 'duplicate_ack' and packet[0:2] == b'\x50\x04':
+                            conn.sendall(framed)  # stale ACK must not complete the next command
         except EOFError:
             pass
         except Exception as exc:
@@ -84,6 +89,7 @@ class Programmer:
             return bytes([cmd, 0])
         if cmd == 0x50:
             sub = body[1]
+            self.events.append(('xprog', sub))
             if sub == 7:
                 self.events.append(('param', body[2], int.from_bytes(body[3:], 'big')))
                 if body[2] == 5:
@@ -109,8 +115,8 @@ class Programmer:
                 data = body[10:]
                 assert len(data) == count
                 self.events.append(('write', body[2], address, count, body[3]))
-                if self.fault == 'write_timeout':
-                    return bytes([cmd, sub, 3])
+                if self.fault in ('write_failed', 'write_collision', 'write_timeout'):
+                    return bytes([cmd, sub, {'write_failed': 1, 'write_collision': 2, 'write_timeout': 3}[self.fault]])
                 if self.fault == 'short_write':
                     return bytes([cmd, sub])
                 if self.fault == 'lost_ack':
@@ -150,7 +156,10 @@ class Programmer:
 
 class FirmwareProgrammer(Programmer):
     """Forward every request to the real firmware, with mocked electrical IO."""
-    def __init__(self, signature, signature_address=0, *, protocol, **kwargs):
+    def __init__(self, signature, signature_address=0, *, protocol, trace_path=None, **kwargs):
+        self.trace_path = trace_path
+        if trace_path:
+            trace_path.write_text('')
         self.process = subprocess.Popen(
             [str(ROOT / '.pio/tests-host/firmware_tests.exe'), '--bridge', protocol],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -159,16 +168,39 @@ class FirmwareProgrammer(Programmer):
     def exchange(self, body):
         self.process.stdin.write(len(body).to_bytes(2, 'big') + body)
         self.process.stdin.flush()
-        header = self.process.stdout.read(2)
-        assert len(header) == 2, 'firmware bridge closed'
-        count = int.from_bytes(header, 'big')
-        reply = self.process.stdout.read(count)
-        assert len(reply) == count, 'short firmware bridge reply'
+        result = queue.Queue()
+        def read_reply():
+            try:
+                header = self.process.stdout.read(2)
+                assert len(header) == 2, 'firmware bridge closed'
+                count = int.from_bytes(header, 'big')
+                reply = self.process.stdout.read(count)
+                assert len(reply) == count, 'short firmware bridge reply'
+                result.put(reply)
+            except Exception as exc:
+                result.put(exc)
+        threading.Thread(target=read_reply, daemon=True).start()
+        try:
+            reply = result.get(timeout=5)
+        except queue.Empty:
+            self.process.kill()
+            self.process.wait()
+            raise AssertionError(f'firmware bridge timeout: request={body.hex()} events={self.events}')
+        if isinstance(reply, Exception):
+            raise reply
         return reply
 
     def handle(self, body):
         self.events.append(('command', body[0]))
-        return self.exchange(body)
+        self.events.append(('request', body.hex()))
+        if self.trace_path:
+            with self.trace_path.open('a') as trace:
+                trace.write('TX ' + body.hex() + '\n')
+        reply = self.exchange(body)
+        if self.trace_path:
+            with self.trace_path.open('a') as trace:
+                trace.write('RX ' + reply.hex() + '\n')
+        return reply
 
     def finish(self):
         try:
@@ -190,6 +222,9 @@ def main():
     args = parser.parse_args()
     build = ROOT / '.pio/tests-host'
     build.mkdir(parents=True, exist_ok=True)
+    report_dir = ROOT / '.pio/stabilization'
+    report_dir.mkdir(parents=True, exist_ok=True)
+    case_results = []
     listing = subprocess.run([str(args.avrdude), '-C', str(args.config), '-c', '?'],
                              capture_output=True, timeout=10)
     names = re.findall(r'^\s+(\S+)\s+=', (listing.stdout + listing.stderr).decode(errors='replace'), re.M)
@@ -212,7 +247,14 @@ def main():
         simulator.finish()
         log = result.stdout.decode(errors='replace') + result.stderr.decode(errors='replace')
         (build / f'{name}.log').write_text(log, encoding='utf-8')
-        assert (result.returncode == 0) == expected_success, f'{name}:\n{log}'
+        passed = (result.returncode == 0) == expected_success
+        case_results.append(dict(name=name, profile=profile, target=part, command=cmd,
+                                 expected='success' if expected_success else 'clear failure',
+                                 actual_exit=result.returncode, status='PASS' if passed else 'FAIL',
+                                 evidence='SIMULATED',
+                                 model='compiled firmware + SPI/GPIO' if factory is FirmwareProgrammer else 'protocol/NVM simulator'))
+        (report_dir / 'xprog-matrix.json').write_text(json.dumps(case_results, indent=2) + '\n')
+        assert passed, f'{name}:\n{log}'
         exercise.simulator = simulator
         return simulator.events
 
@@ -277,18 +319,33 @@ def main():
         assert exercise.simulator.commits == [(1, 0x81fe00), (2, 0x820000)]
         print('PASS PDI: application/boot boundary uses separate page types and commits')
 
-        for fault in ('short_read', 'wrong_subcommand', 'wrong_opcode', 'write_timeout',
+        for fault in ('short_read', 'wrong_subcommand', 'wrong_opcode', 'write_failed', 'write_collision', 'write_timeout',
                       'short_write', 'verify_corrupt', 'lost_ack'):
             exercise(f'error_{fault}', 'stk500v2', 'x128a1', (0x1e, 0x97, 0x4c), 0x1000090,
                      ('-U', f'flash:w:{fixture}:r'), expected_success=False, fault=fault)
             if fault == 'lost_ack':
                 assert sum(e[0] == 'write' for e in exercise.simulator.events) == 1
+            else:
+                assert ('xprog', 2) in exercise.simulator.events, 'failed operation omitted XPROG LEAVE'
         print('PASS XPROG: truncated/mismatched replies, timeout, failed verify and lost ACK return failure')
+
+        exercise('duplicate_ack', 'stk500v2', 'x128a1', (0x1e, 0x97, 0x4c), 0x1000090,
+                 ('-U', f'flash:w:{fixture}:r'), fault='duplicate_ack')
+        assert len(exercise.simulator.commits) == 2
+        print('PASS XPROG: duplicate ACK does not replay writes or complete a different command')
 
         events = exercise('original_stk500_no_xprog', 'stk500v2', 'x128a1', (0x1e, 0x97, 0x4c),
                           expected_success=False, xprog=False)
         assert ('command', 0x50) not in events
+        assert ('command', 0x10) not in events, 'unsupported XPROG fell back to ISP'
         print('PASS original STK500: rejected probe prevents XPROG programming')
+        events = exercise('original_stk500_no_tpi', 'stk500v2', 't10', (0x1e, 0x90, 3),
+                          expected_success=False, xprog=False)
+        assert ('command', 0x50) not in events and ('command', 0x10) not in events
+
+        events = exercise('original_stk500_isp', 'stk500v2', 't13', (0x1e, 0x90, 7), xprog=False)
+        assert ('command', 0x10) in events and not any(e[0]=='mode' for e in events)
+        print('PASS original STK500: ISP without XPROG probe')
 
         exercise('firmware_pdi', 'stk500v2', 'x128a1', (0x1e, 0x97, 0x4c), 0x1000090,
                  ('-U', f'flash:w:{fixture}:r'), factory=FirmwareProgrammer, protocol='pdi')

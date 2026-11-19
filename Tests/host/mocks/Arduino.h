@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <utility>
+#include <functional>
 #define B00100000 0b00100000
 #define B01100000 0b01100000
 #define B01101000 0b01101000
@@ -30,13 +31,16 @@
 #define TCCR2 mockTCCR2
 #define TIMER2_COMP_vect mockTimerInterrupt
 #define ISR(name) void name()
-enum class MockPortOperation { DataDirection, ControlSignals, DataRead, SerialWrite };
+enum class MockPortOperation { DataDirection, ControlSignals, DataRead, SerialWrite, Silent };
 struct MockPortEvent {
     MockPortOperation operation;
     uint8_t value;
 };
 inline bool mockPortTraceEnabled=false;
 inline std::vector<MockPortEvent> mockPortTrace;
+inline std::function<void()> mockDataReadHook;
+inline std::function<void(uint8_t)> mockClockWriteHook;
+inline std::function<int(int)> mockDigitalReadHook;
 inline void mockTrace(MockPortOperation operation, uint8_t value) {
     if(mockPortTraceEnabled) mockPortTrace.push_back({operation,value});
 }
@@ -45,12 +49,14 @@ struct MockRegister {
     bool traceRead=false;
     uint8_t value=0;
     operator uint8_t() const {
+        if(traceRead && mockDataReadHook) mockDataReadHook();
         if(traceRead) mockTrace(operation,value);
         return value;
     }
     MockRegister &operator=(uint8_t next) {
         value=next;
-        if(!traceRead) mockTrace(operation,value);
+        if(!traceRead && operation!=MockPortOperation::Silent) mockTrace(operation,value);
+        if(operation==MockPortOperation::Silent && mockClockWriteHook) mockClockWriteHook(value);
         return *this;
     }
     MockRegister &operator|=(unsigned int bits) { return *this=uint8_t(value|bits); }
@@ -59,7 +65,8 @@ struct MockRegister {
 inline MockRegister DDRB{MockPortOperation::DataDirection};
 inline MockRegister PORTC{MockPortOperation::ControlSignals};
 inline MockRegister PINB{MockPortOperation::DataRead,true};
-inline uint8_t mockTCCR2, TCNT2, OCR2, TIMSK, PORTB, PORTD, DDRC, PINC, SPCR, SPDR;
+inline MockRegister PORTD{MockPortOperation::Silent};
+inline uint8_t mockTCCR2, TCNT2, OCR2, TIMSK, PORTB, DDRC, PINC, SPCR, SPDR;
 enum { WGM21=3, CS21=1, OCIE2=7, SPE=6, CPOL=3, CPHA=2, COM20=4 };
 enum { LOW=0, HIGH=1, INPUT=0, OUTPUT=1, MOSI=5, MISO=6, SCK=7, SS=4 };
 inline uint32_t mockTime=0, mockTick=1;
@@ -78,8 +85,12 @@ inline void digitalWrite(int pin, int value) {
     mockPins.at(pin)=value;
     if(mockPinTraceEnabled) mockPinWrites.emplace_back(pin,value);
 }
-inline void analogWrite(int pin, int value) { ++mockGPIO; mockPins.at(pin)=value; }
-inline int digitalRead(int pin) { return mockPins.at(pin); }
+inline void analogWrite(int pin, int value) {
+    ++mockGPIO;
+    mockPins.at(pin)=value;
+    if(mockPinTraceEnabled) mockPinWrites.emplace_back(pin,value);
+}
+inline int digitalRead(int pin) { return mockDigitalReadHook ? mockDigitalReadHook(pin) : mockPins.at(pin); }
 inline int analogRead(int) { return mockADC >= 0 ? mockADC : (mockPins[13] ? 820 : 0); }
 inline void noInterrupts() {}
 inline void interrupts() {}

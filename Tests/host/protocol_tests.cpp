@@ -9,7 +9,9 @@
 #include "SMoHVPP.h"
 #include "SMoHVSP.h"
 #include "SMoSerialFrame.h"
+#include "SMoSession.h"
 #include <map>
+#include <algorithm>
 #include <iostream>
 #ifdef _WIN32
 #include <io.h>
@@ -90,6 +92,7 @@ struct PDIDevice {
     std::map<uint32_t,uint8_t> memory;
     std::map<uint16_t,uint8_t> buffer;
     std::vector<uint32_t> commits;
+    std::vector<uint8_t> erases;
     uint32_t nvmBase=0x010001C0, pointer=0, address=0;
     uint16_t pageSize=512, repeat=1;
     uint8_t command=0, pending=0, needed=0, nvmCommand=0;
@@ -119,6 +122,16 @@ struct PDIDevice {
     }
     void write(uint32_t a,uint8_t value) {
         if(a==nvmBase+10) { nvmCommand=value; return; }
+        if(nvmCommand==0x22 || nvmCommand==0x2A || nvmCommand==0x32 || nvmCommand==0x18) {
+            const uint32_t base=a&~uint32_t(pageSize-1);
+            for(uint16_t i=0;i<pageSize;++i) memory[base+i]=0xFF;
+            buffer.clear(); erases.push_back(nvmCommand); return;
+        }
+        if(nvmCommand==0x40 && a==nvmBase+11) {
+            for(auto &entry:memory)
+                if(entry.first>=0x800000 && entry.first<0x8E0000) entry.second=0xFF;
+            buffer.clear(); erases.push_back(nvmCommand); return;
+        }
         if(nvmCommand==0x23 || nvmCommand==0x33) {
             buffer[a&(pageSize-1)]=value;
         } else if(nvmCommand==0x24 || nvmCommand==0x25 || nvmCommand==0x2C ||
@@ -199,6 +212,12 @@ static void pdi_tests() {
                                  {data.begin()+offset,data.begin()+end});
             check(reply==std::vector<uint8_t>({CMD_XPROG,XPRG_CMD_WRITE_MEM,0}),"PDI write reply");
             check(device.commits.size()==(end==size ? 1U : 0U),"premature/missing page commit");
+            if(end<size) {
+                auto unloaded=request({CMD_XPROG,XPRG_CMD_READ_MEM,1,0,0x81,0,0,1,0});
+                check(unloaded.size()==259 && std::all_of(unloaded.begin()+3,unloaded.end(),
+                      [](uint8_t value) { return value==0xFF; }),"first 256B fragment changed nonvolatile Flash");
+                check(device.buffer.size()==256,"reading Flash discarded the pending page buffer");
+            }
         }
         for(unsigned i=0;i<size;++i) check(device.read(base+i)==data[i],"PDI page-buffer data lost");
         check(device.buffer.empty(),"page buffer not cleared by commit");
@@ -209,6 +228,21 @@ static void pdi_tests() {
         check(pdi_write(2,2,base+size,std::vector<uint8_t>(5,0x39))[2]==0,"PDI partial boot page");
         check(device.read(base+size+4)==0x39 && device.read(base+size+5)==0xFF,"odd final Flash padding");
         check(request({CMD_XPROG,XPRG_CMD_LEAVE_PROGMODE})[2]==0,"PDI leave");
+    }
+    {
+        PDIDevice device; pdi_enter(device);
+        check(pdi_write(1,0,0x00800000,std::vector<uint8_t>(256,0x12))[2]==0,"PDI unfinished buffer load");
+        check(device.commits.empty(),"PDI incomplete page reached Flash");
+        check(request({CMD_XPROG,XPRG_CMD_LEAVE_PROGMODE})[2]==0,"PDI abort before final fragment");
+        pdi_enter(device);
+        check(device.buffer.empty(),"PDI re-entry retained aborted page buffer");
+        check(pdi_write(1,2,0x00800180,std::vector<uint8_t>(256,0x3C))[2]==0,"PDI crossing page boundary");
+        check(device.commits.size()==2 && device.read(0x00800180)==0x3C && device.read(0x0080027F)==0x3C,"PDI cross-page commits/data");
+        check(request({CMD_XPROG,XPRG_CMD_ERASE,XPRG_ERASE_APP_PAGE,0,0x80,0,0})[2]==0,"PDI application page erase");
+        check(device.read(0x00800180)==0xFF && device.read(0x00800200)==0x3C,"PDI page erase range");
+        check(request({CMD_XPROG,XPRG_CMD_ERASE,XPRG_ERASE_CHIP,0,0,0,0})[2]==0,"PDI chip erase");
+        check(device.read(0x00800200)==0xFF && device.erases.size()==2,"PDI chip erase not executed");
+        check(request({CMD_XPROG,XPRG_CMD_LEAVE_PROGMODE})[2]==0,"PDI leave after erase");
     }
     {
         PDIDevice device;
@@ -313,6 +347,8 @@ struct TPIDevice {
     uint16_t pointer=0;
     uint8_t pending=0, needed=0, identity=0x80, signature=0x90;
     unsigned guard=128;
+    uint8_t nvmCommand=0;
+    unsigned erases=0;
     bool silent=false, active=true, busy=false, badParity=false, badStop=false;
     unsigned identityReads=0;
     void reply(uint8_t value) {
@@ -334,7 +370,19 @@ struct TPIDevice {
         if(needed) {
             if(pending==0x68) pointer=(pointer&0xFF00)|value;
             else if(pending==0x69) pointer=(pointer&0xFF)|(uint16_t(value)<<8);
-            else if(pending==0x64) memory[pointer++]=value;
+            else if(pending==0x64) {
+                memory[pointer]=(memory.count(pointer) ? memory[pointer] : 0xFF)&value;
+                ++pointer;
+            }
+            else if(pending==0xF3) nvmCommand=value;
+            else if(pending==0x60 && nvmCommand==0x10) {
+                for(auto &entry:memory) if(entry.first>=0x4000) entry.second=0xFF;
+                ++erases;
+            }
+            else if(pending==0x60 && nvmCommand==0x14) {
+                memory[pointer&~1U]=memory[pointer|1U]=0xFF;
+                ++erases;
+            }
             else if(pending==0xC2) guard=(value&7)==7 ? 0 : 128U>>(value&7);
             if(!--needed) pending=0;
         } else if(value==0x8F) { ++identityReads; reply(identity); }
@@ -360,6 +408,12 @@ static void tpi_tests() {
         check(device.memory[0x3F40]==0xFE && device.memory[0x3F41]==0xFF,"TPI fuse padding");
         check(request({CMD_XPROG,XPRG_CMD_READ_MEM,4,0,0,0x3F,0x40,0,1})==
               std::vector<uint8_t>({CMD_XPROG,XPRG_CMD_READ_MEM,0,0xFE}),"TPI fuse readback");
+        check(pdi_write(4,2,0x3F40,{0xFF})[2]==0 && device.memory[0x3F40]==0xFE,"TPI model allowed zero-to-one without erase");
+        check(request({CMD_XPROG,XPRG_CMD_ERASE,XPRG_ERASE_CONFIG,0,0,0x3F,0x40})[2]==0,"TPI configuration erase");
+        check(device.memory[0x3F40]==0xFF && device.erases==1,"TPI configuration erase range");
+        check(pdi_write(4,2,0x3F40,{0xFD})[2]==0 && device.memory[0x3F40]==0xFD,"TPI fuse reprogram after erase");
+        check(request({CMD_XPROG,XPRG_CMD_ERASE,XPRG_ERASE_CHIP,0,0,0x40,0})[2]==0,"TPI chip erase");
+        check(device.memory[0x4000]==0xFF && device.memory[0x3F40]==0xFD && device.erases==2,"TPI chip erase range");
         check(request({CMD_XPROG,XPRG_CMD_LEAVE_PROGMODE})[2]==0 && !mockPins[11] && !SPI.active,"TPI cleanup");
     }
     {
@@ -497,6 +551,80 @@ static void hv_tests() {
     std::cout<<"PASS HVPP/HVSP fuse/lock/erase RDY and timed cycles, timeout cleanup and ADC failure\n";
 }
 
+static void session_tests() {
+    const uint32_t timeout=SMoSession::kIdleTimeout;
+    mockTick=0; mockTime=0; mockADC=-1;
+    SPI.onTransfer={}; SPI.onWrite={};
+    SMoCommand::gProgrammingMode=0;
+    const std::vector<uint8_t> enterHVSP={CMD_ENTER_PROGMODE_HVSP,0,0,6,1,1,25,1,0};
+    const std::vector<uint8_t> enterHVPP={CMD_ENTER_PROGMODE_PP,0,0,1,1,25,1,0};
+    for(const auto &enter: {enterHVSP,enterHVPP}) {
+        for(uint32_t start: {0U,UINT32_MAX-1000}) {
+            mockTime=start;
+            check(dispatch(enter)[1]==0,"HV lease enter");
+            mockTime+=timeout-1;
+            loop();
+            check(mockPins[11]==HIGH,"HV lease expired early");
+            ++mockTime;
+            mockPinWrites.clear(); mockPinTraceEnabled=true;
+            Serial.output.clear(); loop(); mockPinTraceEnabled=false;
+            check(!SMoCommand::gProgrammingMode && !mockPins[11] && !mockPins[13],"idle HV did not shut down");
+            check(mockPins[10]==HIGH && !uint8_t(DDRB) && !DDRC && !mockTCCR2 && !SPI.active,"idle HV left pins/peripherals active");
+            check(mockPinWrites.size()>=3 && mockPinWrites[0]==std::make_pair(11,int(LOW)) &&
+                  mockPinWrites[1]==std::make_pair(10,int(HIGH)) &&
+                  mockPinWrites[2]==std::make_pair(13,0),"idle shutdown must disable HV, clamp RESET, then turn off VTARGET");
+            check(Serial.output.empty(),"lease expiry emitted an unsolicited reply");
+            check(dispatch(enter)[1]==0,"HV re-entry after host loss");
+            check(dispatch({uint8_t(enter[0]+1),0,0})[1]==0,"HV leave after recovery");
+        }
+    }
+    check(dispatch(enterHVPP)[1]==0,"HV keepalive enter");
+    for(unsigned i=0;i<4;++i) {
+        mockTime+=timeout/2;
+        check(dispatch({CMD_GET_PARAMETER,PARAM_VTARGET})[1]==0 && mockPins[11],"valid keepalive lost HV");
+    }
+    mockTime+=timeout-1;
+    // A well-framed but invalid request and a bad checksum must not renew.
+    check(dispatch({CMD_READ_FLASH_PP,0,0})[1]==STATUS_CMD_FAILED,"invalid read accepted");
+    auto corrupt=frame({CMD_GET_PARAMETER,PARAM_VTARGET}); corrupt.back()^=1;
+    Serial.input.assign(corrupt.begin(),corrupt.end());
+    while(Serial.available()) loop();
+    ++mockTime; loop();
+    check(!mockPins[11],"invalid traffic kept HV alive");
+
+    check(dispatch(enterHVPP)[1]==0,"long HV command enter");
+    mockTime+=timeout-1;
+    SMoGeneral::gAddress.l=0; PINB=0xA5;
+    mockDataReadHook=[] { mockTime+=1000; };
+    auto reply=dispatch({CMD_READ_FLASH_PP,0,64}); // simulate slow IO inside a valid command
+    mockDataReadHook={};
+    check(reply.size()==67 && reply[1]==0 && mockPins[11],"lease expired inside a long valid command");
+    mockTime+=timeout-1; loop();
+    check(mockPins[11],"successful long command did not renew lease");
+    ++mockTime; loop(); check(!mockPins[11],"HV idle after long operation did not expire");
+
+    {
+        TPIDevice device; device.attach(); mode(XPRG_MODE_TPI);
+        check(request({CMD_XPROG,XPRG_CMD_ENTER_PROGMODE})[2]==0,"TPI lease enter");
+        mockTime+=timeout-1;
+        check(dispatch({CMD_XPROG,0})[2]==XPRG_ERR_FAILED,"invalid XPROG accepted");
+        ++mockTime; loop();
+        check(!mockPins[11] && !mockPins[13] && !SPI.active && !SMoXPROG::HighVoltageActive(),"TPI idle left HV/session active");
+        check(request({CMD_XPROG,XPRG_CMD_ENTER_PROGMODE})[2]==0,"TPI reopen after expiry");
+        check(request({CMD_XPROG,XPRG_CMD_LEAVE_PROGMODE})[2]==0,"TPI leave after expiry recovery");
+    }
+    check(dispatch(enterHVPP)[1]==0,"HV partial-frame expiry enter");
+    mockTime+=timeout-1;
+    Serial.input={MESSAGE_START,1};
+    while(Serial.available()) loop();
+    ++mockTime; loop();
+    check(!mockPins[11],"partial packet kept HV alive");
+    check(dispatch(enterHVPP)[1]==0,"new connection was consumed as an expired partial header");
+    check(dispatch({CMD_LEAVE_PROGMODE_PP,0,0})[1]==0,"HV leave after partial-frame recovery");
+    mockTick=1;
+    std::cout<<"PASS HV idle lease: HVSP/HVPP/TPI, wraparound, ordered shutdown, invalid traffic, keepalive, long command and reconnect\n";
+}
+
 void protocol_tests() {
     serial_frame_tests();
     pdi_tests();
@@ -504,7 +632,79 @@ void protocol_tests() {
     isp_tests();
     hv_tests();
     validation_tests();
+    session_tests();
 }
+
+// Electrical/protocol model for standard AVR programming. It responds at the
+// SPI/GPIO boundary; requests still pass through the real firmware handlers.
+struct LegacyDevice {
+    std::string protocol;
+    std::array<uint8_t,3> signature;
+    std::array<uint8_t,4> spi{};
+    unsigned spiIndex=0, bitIndex=0;
+    uint8_t command=0, previousInstruction=0, instruction=0, data=0, output=0;
+    uint16_t address=0;
+    bool clocked=false;
+    LegacyDevice(std::string mode):protocol(mode),signature(mode=="hvpp" ?
+        std::array<uint8_t,3>{0x1E,0x95,2} : std::array<uint8_t,3>{0x1E,0x90,7}) {}
+    uint8_t read(uint8_t instruction) {
+        if(command==8) {
+            if(instruction&0x10) return address&1 ? 0x54 : 0x57;
+            return address<signature.size() ? signature[address] : 0xFF;
+        }
+        if(command==4) return instruction==0x68 ? 0x6A : 0xFF;
+        return 0xFF;
+    }
+    void attach() {
+        if(protocol=="isp") {
+            SPI.onTransfer=[this](uint8_t value) {
+                const unsigned index=spiIndex++%4;
+                spi[index]=value;
+                if(index==2 && spi[0]==0xAC && spi[1]==0x53) return uint8_t(0x53);
+                if(index!=3) return uint8_t(0);
+                if(spi[0]==0x30) return spi[2]<3 ? signature[spi[2]] : uint8_t(0xFF);
+                if(spi[0]==0x38) return uint8_t(spi[2]&1 ? 0x54 : 0x57);
+                if(spi[0]==0x50) return uint8_t(spi[1]==0 ? 0x6A : 0xFF);
+                return uint8_t(0xFF);
+            };
+        } else if(protocol=="hvpp") {
+            mockClockWriteHook=[this](uint8_t value) {
+                if(value&0x80) return;
+                const uint8_t controls=uint8_t(PORTC);
+                const uint8_t mask=SMoGeneral::gControlStack[25];
+                if(controls==(SMoGeneral::gControlStack[8]&mask)) command=PORTB;
+                else if(controls==(SMoGeneral::gControlStack[0]&mask)) address=(address&0xFF00)|PORTB;
+                else if(controls==(SMoGeneral::gControlStack[1]&mask)) address=(address&0xFF)|(uint16_t(PORTB)<<8);
+            };
+            mockDataReadHook=[this] {
+                const uint8_t controls=uint8_t(PORTC);
+                const uint8_t mask=SMoGeneral::gControlStack[25];
+                if(command==8) PINB.value=read(controls==(SMoGeneral::gControlStack[21]&mask) ? 0x78 : 0x68);
+                else PINB.value=controls==(SMoGeneral::gControlStack[20]&mask) ? 0x6A : 0xFF;
+            };
+        } else {
+            mockClockWriteHook=[this](uint8_t value) { if(value&0x80) clocked=true; };
+            mockDigitalReadHook=[this](int pin) {
+                if(pin!=2) return mockPins.at(pin);
+                if(!clocked) return 1; // ready, outside an SCI transfer
+                clocked=false;
+                if(!bitIndex) { output=read(previousInstruction); instruction=data=0; }
+                if(bitIndex>=1 && bitIndex<=8) {
+                    instruction=uint8_t((instruction<<1)|mockPins[1]);
+                    data=uint8_t((data<<1)|mockPins[0]);
+                }
+                const int value=bitIndex<8 ? ((output>>(7-bitIndex))&1) : 1;
+                if(++bitIndex==11) {
+                    bitIndex=0; previousInstruction=instruction;
+                    if(instruction==0x4C) command=data;
+                    else if(instruction==0x0C) address=(address&0xFF00)|data;
+                    else if(instruction==0x1C) address=(address&0xFF)|(uint16_t(data)<<8);
+                }
+                return value;
+            };
+        }
+    }
+};
 
 // Binary stdin/stdout adapter lets the real AVRDUDE drive the same compiled
 // parser/dispatcher/PDI implementation and NVM model over a loopback socket.
@@ -515,15 +715,18 @@ int firmware_bridge(const char *protocol) {
 #endif
     PDIDevice pdi;
     TPIDevice tpi;
+    LegacyDevice legacy(protocol);
     if(std::string(protocol)=="pdi") {
         pdi.memory[0x01000090]=0x1E;
         pdi.memory[0x01000091]=0x97;
         pdi.memory[0x01000092]=0x4C;
         pdi.attach();
-    } else {
+    } else if(std::string(protocol)=="tpi") {
         tpi.memory[0x3FC0]=0x1E;
         tpi.memory[0x3FC2]=0x03;
         tpi.attach();
+    } else {
+        legacy.attach();
     }
     for(;;) {
         int high=std::cin.get(),low=std::cin.get();

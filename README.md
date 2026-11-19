@@ -16,5 +16,8 @@ you like living dangerously!
 This fork includes support for the improved HVprog2 hardware. The local
 development target is ATmega32 at 7.3728 MHz.
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for setup and build instructions. The full
-firmware builds successfully: 12950 bytes of flash and 541 bytes of static RAM.
+See [DEVELOPMENT.md](DEVELOPMENT.md) for setup and build instructions.
+[STABILIZATION.md](STABILIZATION.md) documents the current compatibility matrix,
+30-second HV idle shutdown, verified connector numbering and remaining hardware
+acceptance steps. Standard ISP/HVSP/HVPP work with public AVRDUDE; TPI/PDI through
+`stk500v2` require the corresponding AVRDUDE fork.

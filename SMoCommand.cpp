@@ -19,6 +19,7 @@
 
 #include "SMoCommand.h"
 #include "SMoConfig.h"
+#include "SMoSession.h"
 
 const uint16_t  kHeaderSize         = 5;
 const uint16_t  kMaxBodySize        = 275;  // STK500 hardware limit
@@ -47,6 +48,12 @@ ResetToIdle()
     sNumBytesRead   = 0;
     sNumBytesWanted = 1;
     sCheckSum       = 0;
+}
+
+void SMoCommand::ResetParser()
+{
+    ResetToIdle();
+    gSize = 0;
 }
 //
 // Parse next command, return command code if command is fully read
@@ -157,6 +164,10 @@ SMoCommand::SendResponse(uint8_t status, uint16_t bodySize)
         digitalWrite(SMO_RLED, LOW);
     }
 #endif
+    const bool succeeded = gBody[0] == CMD_XPROG ?
+        bodySize >= 3 && gBody[2] == 0 : status == STATUS_CMD_OK;
+    if (succeeded)
+        SMoSession::Refresh();
     ResetToIdle();
 }
 

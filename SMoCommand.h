@@ -38,6 +38,7 @@ namespace SMoCommand {
     //
     bool        ValidRequest();
     int         GetNextCommand();
+    void        ResetParser();
     void        SendResponse(uint8_t status = STATUS_CMD_OK, uint16_t bodySize=2);
 } // namespace SMoCommand
 

@@ -37,6 +37,7 @@
 #include "SMoHVPP.h"
 #include "SMoXPROG.h"
 #include "SMoSafety.h"
+#include "SMoSession.h"
 
 void
 setup()
@@ -59,6 +60,7 @@ setup()
 void
 loop()
 {
+    SMoSession::Poll();
     const int command = SMoCommand::GetNextCommand();
     if (command > 0 && !SMoCommand::ValidRequest()) {
         SMoCommand::SendResponse(STATUS_CMD_FAILED);

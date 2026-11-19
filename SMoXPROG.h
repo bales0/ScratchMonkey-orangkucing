@@ -18,6 +18,8 @@
 #define _SMO_XPROG_
 
 namespace SMoXPROG {
+    bool HighVoltageActive();
+    void ResetSession();
     void Release();
     void XPROG();
     void XPROG_SetMode();

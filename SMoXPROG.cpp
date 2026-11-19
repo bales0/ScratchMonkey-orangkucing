@@ -243,6 +243,16 @@ void SMoXPROG::Release()
 {
     if (SelectedProtocol == XPRG_MODE_PDI) SMoPDI::Release();
     else SMoTPI::Release();
+    ResetSession();
+}
+
+bool SMoXPROG::HighVoltageActive()
+{
+    return sActive && SelectedProtocol == XPRG_MODE_TPI;
+}
+
+void SMoXPROG::ResetSession()
+{
     sActive = false;
     SMoCommand::gProgrammingMode = 0;
     SMoGeneral::gVoltage = 50;
